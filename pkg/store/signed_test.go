@@ -6,8 +6,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/golang-jwt/jwt/v5"
 
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/auth"
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/store"
@@ -369,5 +373,200 @@ func TestSignedStore_NewRejectsMissingKeyFile(t *testing.T) {
 	}
 	if _, err := store.New(cfg); err == nil {
 		t.Fatal("New with missing key file: expected error, got nil")
+	}
+}
+
+// signWithMethod produces a JWT signed with the given method using
+// the test signing key. Tests use it to construct tokens whose
+// header doesn't match what the SignedStore parser is configured to
+// accept, so the parser's WithValidMethods constraint can be
+// exercised directly.
+func signWithMethod(t *testing.T, method jwt.SigningMethod, claims jwt.MapClaims) string {
+	t.Helper()
+	tok := jwt.NewWithClaims(method, claims)
+	signed, err := tok.SignedString(signedKey())
+	if err != nil {
+		t.Fatalf("sign with %s: %v", method.Alg(), err)
+	}
+	return signed
+}
+
+// TestSignedStore_RejectsWrongAlgorithm pins the WithValidMethods
+// constraint. A token signed with the same key but a different HMAC
+// algorithm (HS512) must be rejected; otherwise an attacker who
+// could induce the broker to accept tokens of an algorithm chosen by
+// the header would be able to bypass downgrade protections.
+func TestSignedStore_RejectsWrongAlgorithm(t *testing.T) {
+	t.Parallel()
+	s := newSignedStore(t)
+	now := time.Now()
+	tok := signWithMethod(t, jwt.SigningMethodHS512, jwt.MapClaims{
+		"iss":           store.DefaultSignedIssuer,
+		"sub":           "test",
+		"iat":           now.Unix(),
+		"exp":           now.Add(5 * time.Minute).Unix(),
+		"identity_type": string(auth.IdentityTypeCI),
+	})
+	if _, err := s.Claim(tok); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("Claim of HS512-signed token: got err %v, want ErrNotFound", err)
+	}
+}
+
+// TestSignedStore_RejectsInvalidIdentityType pins the defence-in-
+// depth check that the identity_type claim, even when it is covered
+// by a valid signature, must be one of the known IdentityType values.
+func TestSignedStore_RejectsInvalidIdentityType(t *testing.T) {
+	t.Parallel()
+	s := newSignedStore(t)
+	now := time.Now()
+	tok := signWithMethod(t, jwt.SigningMethodHS256, jwt.MapClaims{
+		"iss":           store.DefaultSignedIssuer,
+		"sub":           "test",
+		"iat":           now.Unix(),
+		"exp":           now.Add(5 * time.Minute).Unix(),
+		"identity_type": "robot",
+	})
+	if _, err := s.Claim(tok); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("Claim of token with unknown identity_type: got err %v, want ErrNotFound", err)
+	}
+}
+
+// TestSignedStore_ClaimErrorCarriesReason verifies that the failure
+// path returns an error whose string includes a human-readable
+// reason in addition to wrapping ErrNotFound. Operators rely on the
+// reason to triage in audit logs.
+func TestSignedStore_ClaimErrorCarriesReason(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name        string
+		token       func(t *testing.T, s *store.SignedStore) string
+		wantSubstr  string
+		fastForward time.Duration
+	}{
+		{
+			name: "expired",
+			token: func(t *testing.T, s *store.SignedStore) string {
+				tok, err := s.Mint(newRecord(t))
+				if err != nil {
+					t.Fatalf("Mint: %v", err)
+				}
+				return tok
+			},
+			wantSubstr:  "expired",
+			fastForward: time.Hour,
+		},
+		{
+			name: "wrong issuer",
+			token: func(t *testing.T, _ *store.SignedStore) string {
+				other, err := store.NewSignedStore(signedKey(), 5*time.Minute, "other-issuer")
+				if err != nil {
+					t.Fatalf("NewSignedStore: %v", err)
+				}
+				tok, err := other.Mint(newRecord(t))
+				if err != nil {
+					t.Fatalf("Mint: %v", err)
+				}
+				return tok
+			},
+			wantSubstr: "issuer",
+		},
+		{
+			name: "bad signature",
+			token: func(t *testing.T, _ *store.SignedStore) string {
+				other, err := store.NewSignedStore(bytes.Repeat([]byte{0xFF}, store.MinSignedKeyBytes), 5*time.Minute, "")
+				if err != nil {
+					t.Fatalf("NewSignedStore: %v", err)
+				}
+				tok, err := other.Mint(newRecord(t))
+				if err != nil {
+					t.Fatalf("Mint: %v", err)
+				}
+				return tok
+			},
+			wantSubstr: "signature",
+		},
+		{
+			name: "malformed",
+			token: func(_ *testing.T, _ *store.SignedStore) string {
+				return "not.a.jwt"
+			},
+			wantSubstr: "malformed",
+		},
+		{
+			name: "wrong algorithm",
+			token: func(t *testing.T, _ *store.SignedStore) string {
+				now := time.Now()
+				return signWithMethod(t, jwt.SigningMethodHS512, jwt.MapClaims{
+					"iss": store.DefaultSignedIssuer,
+					"sub": "test",
+					"iat": now.Unix(),
+					"exp": now.Add(5 * time.Minute).Unix(),
+				})
+			},
+			wantSubstr: "signing method",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := newSignedStore(t)
+			tok := tc.token(t, s)
+			if tc.fastForward > 0 {
+				s.SetNow(func() time.Time { return time.Now().Add(tc.fastForward) })
+			}
+			_, err := s.Claim(tok)
+			if !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("Claim: got err %v, want wrapped ErrNotFound", err)
+			}
+			if !strings.Contains(err.Error(), tc.wantSubstr) {
+				t.Errorf("Claim error %q: want substring %q", err.Error(), tc.wantSubstr)
+			}
+		})
+	}
+}
+
+// TestSignedStore_Concurrent fans out N concurrent Mint+Claim pairs
+// against a single SignedStore. The race detector catches any
+// shared-state bug; the assertion catches any misuse of the parser
+// that produces incorrect results under load. The store is supposed
+// to be safe for concurrent use because every per-call value is
+// derived from immutable receiver state plus call-local data.
+func TestSignedStore_Concurrent(t *testing.T) {
+	t.Parallel()
+	const goroutines = 64
+
+	s := newSignedStore(t)
+	var (
+		wg     sync.WaitGroup
+		failed atomic.Int32
+	)
+	wg.Add(goroutines)
+	start := make(chan struct{})
+	for range goroutines {
+		go func() {
+			defer wg.Done()
+			<-start
+			tok, err := s.Mint(newRecord(t))
+			if err != nil {
+				t.Errorf("Mint: %v", err)
+				failed.Add(1)
+				return
+			}
+			rec, err := s.Claim(tok)
+			if err != nil {
+				t.Errorf("Claim: %v", err)
+				failed.Add(1)
+				return
+			}
+			if rec.Identity.Principal != "repo:owner/repo:ref:refs/heads/main" {
+				t.Errorf("Claim returned wrong principal: %q", rec.Identity.Principal)
+				failed.Add(1)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if got := failed.Load(); got != 0 {
+		t.Fatalf("%d/%d concurrent Mint+Claim pairs failed", got, goroutines)
 	}
 }

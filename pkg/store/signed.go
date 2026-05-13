@@ -185,25 +185,33 @@ func (s *SignedStore) Claim(token string) (*Record, error) {
 	parsed, err := s.parser.Parse(token, func(_ *jwt.Token) (any, error) {
 		return s.key, nil
 	})
-	if err != nil || !parsed.Valid {
-		return nil, ErrNotFound
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s", ErrNotFound, err)
+	}
+	if !parsed.Valid {
+		return nil, fmt.Errorf("%w: token is not valid", ErrNotFound)
 	}
 
 	claims, ok := parsed.Claims.(jwt.MapClaims)
 	if !ok {
-		return nil, ErrNotFound
+		return nil, fmt.Errorf("%w: claims have unexpected type", ErrNotFound)
 	}
 
 	principal, err := claims.GetSubject()
 	if err != nil {
-		return nil, ErrNotFound
+		return nil, fmt.Errorf("%w: missing sub claim", ErrNotFound)
 	}
 	exp, err := claims.GetExpirationTime()
 	if err != nil || exp == nil {
-		return nil, ErrNotFound
+		return nil, fmt.Errorf("%w: missing exp claim", ErrNotFound)
 	}
 
 	identityType, _ := claims[claimIdentityType].(string)
+	switch auth.IdentityType(identityType) {
+	case auth.IdentityTypeCI, auth.IdentityTypeUser:
+	default:
+		return nil, fmt.Errorf("%w: identity_type %q is not recognised", ErrNotFound, identityType)
+	}
 	rawClaims, _ := claims[claimIdentityClaims].(map[string]any)
 
 	rawDestinations, _ := claims[claimGrantedDestinations].([]any)

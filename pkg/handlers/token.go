@@ -103,7 +103,12 @@ func (h *TokenHandler) serve(w http.ResponseWriter, r *http.Request) (int, strin
 	rec, err := h.store.Claim(req.Nonce)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			h.recordFailure("", req.Destination, http.StatusGone)
+			// Audit log carries the underlying reason (expired,
+			// bad signature, wrong issuer, etc.) so that
+			// operators can distinguish routine token expiry
+			// from active forgery attempts. The HTTP response
+			// stays opaque so callers cannot probe.
+			h.recordClaimFailure(req.Destination, http.StatusGone, err)
 			http.Error(w, "nonce is not valid", http.StatusGone)
 			return http.StatusGone, "", req.Destination
 		}
@@ -184,6 +189,23 @@ func (h *TokenHandler) recordFailure(identityType, destination string, status in
 		Destination:  destination,
 		Success:      false,
 		Error:        http.StatusText(status),
+	})
+}
+
+func (h *TokenHandler) recordClaimFailure(destination string, status int, err error) {
+	if h.audit == nil {
+		return
+	}
+	msg := http.StatusText(status)
+	if err != nil {
+		msg = msg + ": " + err.Error()
+	}
+	h.audit.Log(context.Background(), audit.Event{
+		Time:        h.now(),
+		Op:          audit.OperationToken,
+		Destination: destination,
+		Success:     false,
+		Error:       msg,
 	})
 }
 

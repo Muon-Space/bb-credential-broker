@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/audit"
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/auth"
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/destinations"
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/handlers"
@@ -192,6 +193,44 @@ func TestToken_HappyPath(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), `"abc123"`) {
 		t.Errorf("response body missing token: %s", w.Body.String())
+	}
+}
+
+// TestToken_ClaimFailureAuditCarriesReason proves that when Claim
+// rejects a token, the underlying reason (expired, bad signature,
+// etc.) is preserved in the audit-log Error field while the HTTP
+// response body remains opaque. Operators rely on this distinction
+// to triage routine token expiry from active forgery attempts.
+func TestToken_ClaimFailureAuditCarriesReason(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t, time.Minute)
+	nonce := mintNonce(t, s, "alpha")
+	s.SetNow(func() time.Time { return time.Now().Add(time.Hour) })
+
+	var buf bytes.Buffer
+	auditLog := audit.NewLogger(&buf)
+	h := handlers.NewTokenHandler(
+		[]*net.IPNet{mustCIDR(t, "10.0.0.0/8")},
+		s,
+		destinations.Registry{},
+		auditLog,
+		nil,
+	)
+
+	r := httptest.NewRequest(http.MethodPost, "/token",
+		strings.NewReader(`{"nonce":"`+nonce+`","destination":"alpha"}`))
+	r.RemoteAddr = "10.0.0.42:12345"
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+
+	if w.Code != http.StatusGone {
+		t.Fatalf("status: got %d, want %d", w.Code, http.StatusGone)
+	}
+	if strings.Contains(w.Body.String(), "expired") {
+		t.Errorf("client response body must not leak the underlying reason: %s", w.Body.String())
+	}
+	if !strings.Contains(buf.String(), "expired") {
+		t.Errorf("audit log must carry the underlying reason: %s", buf.String())
 	}
 }
 
