@@ -2,8 +2,9 @@
 
 `bb-credential-broker` mints short-lived, per-build-identity credentials for
 actions running on Buildbarn Remote Execution workers. It allows workers to
-hold zero long-lived secret material: each action carries a single-use nonce
-that the worker exchanges for destination-scoped tokens at runtime.
+hold zero long-lived secret material: each action carries a short-lived
+delegation token that the worker exchanges for destination-scoped credentials
+at runtime.
 
 The broker is intended to be deployed alongside `bb-storage`, `bb-scheduler`
 and `bb-worker` inside the same Kubernetes namespace.
@@ -16,12 +17,14 @@ Two endpoints, both speaking JSON over HTTP:
   Validates the caller's JWT against the configured set of issuers, resolves
   the JWT claims to an `Identity`, and consults the per-identity policy to
   determine the set of destinations the caller is allowed to mint tokens
-  for. Returns a single-use nonce with a short TTL.
+  for. Returns a short-lived delegation token (a broker-signed JWT) and the
+  granted destinations.
 
 - `POST /token` — exposed only inside the cluster; further restricted to a
-  set of source CIDRs as defense-in-depth. Accepts a nonce together with the
-  name of a destination, claims the nonce atomically, dispatches to the
-  named destination's mint flow, and returns the freshly minted token.
+  set of source CIDRs as defense-in-depth. Accepts a delegation token
+  together with the name of a destination, validates the token against the
+  broker's signing key, dispatches to the named destination's mint flow,
+  and returns the freshly minted credential.
 
 The broker has no compiled-in knowledge of any particular destination
 service. It contains a single generic destination type, `httpTokenExchange`,
@@ -43,7 +46,7 @@ The top-level structure is:
   diagnosticsServer: { listenAddress: ':9980' },
   tokenAllowedCIDRs: ['10.0.0.0/8'],
   jwtAuth:    { issuers: [...] },
-  nonceStore: { inMemory: { ttl: '15m', maxSize: 100000 } },
+  nonceStore: { signed: { signingKeyFile: '/etc/broker/signing-key', ttl: '5m' } },
   secrets:    { 'name-of-secret': { awsSecretsManager: { arn, field } }, ... },
   destinations: {
     'destination-name': {
@@ -78,6 +81,46 @@ expressions; the innermost expression is evaluated first.
 | `${now+DUR}` | Unix epoch seconds plus a Go-style duration. | `${now+540s}`, `${now+10m}` |
 | `${b64:STR}` | Base64 encode the argument. | `${b64:user:pass}` |
 | `${env:VAR}` | Read an environment variable. Substituted at start-up rather than per request. | `${env:AWS_REGION}` |
+
+### Nonce store
+
+`/delegate` returns a delegation token whose validity is determined entirely
+by its signature. Any broker replica that holds the same signing key can
+validate any other replica's tokens, which means the broker can be deployed
+with `replica_count > 1` without a shared backend. The trade-off is that the
+strict single-use property of an in-memory nonce is downgraded to "limited
+use within the TTL window": a token may be claimed any number of times until
+its expiry.
+
+The signing key is HMAC-SHA-256 (HS256). Operators generate a key, mount it
+into the broker's pod from a Kubernetes Secret, and reference its file path
+from the broker's configuration:
+
+```sh
+# Generate a 32-byte random key on a workstation.
+openssl rand 32 > broker-signing-key
+
+# Stage it as a Kubernetes Secret.
+kubectl create secret generic bb-credential-broker-signing-key \
+  --from-file=key=broker-signing-key
+
+# Mount it into the broker's pod (excerpt):
+#   volumes:
+#     - name: signing-key
+#       secret: { secretName: bb-credential-broker-signing-key }
+#   volumeMounts:
+#     - name: signing-key
+#       mountPath: /etc/broker
+#       readOnly: true
+#
+# And reference the file from the broker's config:
+#   nonceStore: { signed: { signingKeyFile: '/etc/broker/key', ttl: '5m' } }
+```
+
+The broker requires at least 32 bytes (256 bits) of key material, which is
+the minimum recommended for HS256 by RFC 7518 §3.2. Key rotation is a pod
+restart with the new key in place; this release does not implement kid-based
+key sets.
 
 ## Building
 

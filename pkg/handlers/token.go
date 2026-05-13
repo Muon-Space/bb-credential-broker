@@ -102,16 +102,14 @@ func (h *TokenHandler) serve(w http.ResponseWriter, r *http.Request) (int, strin
 
 	rec, err := h.store.Claim(req.Nonce)
 	if err != nil {
-		switch {
-		case errors.Is(err, store.ErrNotFound), errors.Is(err, store.ErrAlreadyClaimed):
+		if errors.Is(err, store.ErrNotFound) {
 			h.recordFailure("", req.Destination, http.StatusGone)
 			http.Error(w, "nonce is not valid", http.StatusGone)
 			return http.StatusGone, "", req.Destination
-		default:
-			h.recordFailure("", req.Destination, http.StatusInternalServerError)
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return http.StatusInternalServerError, "", req.Destination
 		}
+		h.recordFailure("", req.Destination, http.StatusInternalServerError)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return http.StatusInternalServerError, "", req.Destination
 	}
 	identityType := string(rec.Identity.Type)
 	if !rec.AllowsDestination(req.Destination) {

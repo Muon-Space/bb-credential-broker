@@ -24,7 +24,7 @@ const validJsonnet = `
     ],
   },
   nonceStore: {
-    inMemory: { ttl: '15m', maxSize: 100000 },
+    signed: { signingKeyFile: '/etc/broker/key', ttl: '5m' },
   },
   secrets: {
     'github-app-key': {
@@ -72,8 +72,8 @@ func TestLoad_HappyPath(t *testing.T) {
 	if len(cfg.JWTAuth.Issuers) != 1 {
 		t.Fatalf("JWTAuth.Issuers: got %d, want 1", len(cfg.JWTAuth.Issuers))
 	}
-	if cfg.NonceStore.InMemory == nil {
-		t.Fatal("NonceStore.InMemory: got nil")
+	if cfg.NonceStore.Signed == nil {
+		t.Fatal("NonceStore.Signed: got nil")
 	}
 	if _, ok := cfg.Destinations["example"]; !ok {
 		t.Errorf("Destinations: missing key %q", "example")
@@ -89,7 +89,7 @@ func TestLoad_RejectsMissingAPIServer(t *testing.T) {
   diagnosticsServer: { listenAddress: ':9980' },
   tokenAllowedCIDRs: ['10.0.0.0/8'],
   jwtAuth: { issuers: [{ url: 'x', jwksFile: '/etc/jwks/x.json', identityType: 'ci' }] },
-  nonceStore: { inMemory: { ttl: '15m' } },
+  nonceStore: { signed: { signingKeyFile: '/etc/broker/key', ttl: '5m' } },
 }`
 	_, err := config.Load(writeConfig(t, body))
 	if err == nil {
@@ -104,7 +104,7 @@ func TestLoad_RejectsBadCIDR(t *testing.T) {
   diagnosticsServer: { listenAddress: ':9980' },
   tokenAllowedCIDRs: ['not-a-cidr'],
   jwtAuth: { issuers: [{ url: 'x', jwksFile: '/etc/jwks/x.json', identityType: 'ci' }] },
-  nonceStore: { inMemory: { ttl: '15m' } },
+  nonceStore: { signed: { signingKeyFile: '/etc/broker/key', ttl: '5m' } },
 }`
 	_, err := config.Load(writeConfig(t, body))
 	if err == nil {
@@ -119,7 +119,7 @@ func TestLoad_RejectsUnknownTopLevelField(t *testing.T) {
   diagnosticsServer: { listenAddress: ':9980' },
   tokenAllowedCIDRs: ['10.0.0.0/8'],
   jwtAuth: { issuers: [{ url: 'x', jwksFile: '/etc/jwks/x.json', identityType: 'ci' }] },
-  nonceStore: { inMemory: { ttl: '15m' } },
+  nonceStore: { signed: { signingKeyFile: '/etc/broker/key', ttl: '5m' } },
   unknownField: 'hello',
 }`
 	_, err := config.Load(writeConfig(t, body))
@@ -135,7 +135,7 @@ func TestLoad_RejectsBadIdentityType(t *testing.T) {
   diagnosticsServer: { listenAddress: ':9980' },
   tokenAllowedCIDRs: ['10.0.0.0/8'],
   jwtAuth: { issuers: [{ url: 'x', jwksFile: '/etc/jwks/x.json', identityType: 'frog' }] },
-  nonceStore: { inMemory: { ttl: '15m' } },
+  nonceStore: { signed: { signingKeyFile: '/etc/broker/key', ttl: '5m' } },
 }`
 	_, err := config.Load(writeConfig(t, body))
 	if err == nil {

@@ -12,7 +12,6 @@ import (
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/auth"
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/handlers"
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/policy"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/store"
 )
 
 // fakeValidator is a BearerValidator that returns the configured
@@ -40,7 +39,7 @@ func newDelegateHandler(t *testing.T, allowed []string) *handlers.DelegateHandle
 	return handlers.NewDelegateHandler(
 		&fakeValidator{identity: id},
 		&fakePolicy{allowed: allowed},
-		store.NewInMemoryStore(15*time.Minute, 0),
+		newTestStore(t, 15*time.Minute),
 		nil,
 		nil,
 	)
@@ -133,7 +132,7 @@ func TestDelegate_EmptyPolicyDeniesByDefault(t *testing.T) {
 		t.Fatalf("policy.New: %v", err)
 	}
 	h := handlers.NewDelegateHandler(&fakeValidator{identity: id}, eng,
-		store.NewInMemoryStore(time.Minute, 0), nil, nil)
+		newTestStore(t, time.Minute), nil, nil)
 
 	r := httptest.NewRequest(http.MethodPost, "/delegate",
 		strings.NewReader(`{"requested_destinations":["alpha"]}`))
@@ -155,7 +154,7 @@ func TestDelegate_HonoursStoreTTL(t *testing.T) {
 	h := handlers.NewDelegateHandler(
 		&fakeValidator{identity: id},
 		&fakePolicy{allowed: []string{"alpha"}},
-		store.NewInMemoryStore(configuredTTL, 0),
+		newTestStore(t, configuredTTL),
 		nil,
 		nil,
 	)

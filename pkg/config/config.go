@@ -141,8 +141,14 @@ func (c *Config) Validate() error {
 				i, auth.IdentityTypeCI, auth.IdentityTypeUser)
 		}
 	}
-	if c.NonceStore.InMemory == nil {
-		return fmt.Errorf("nonceStore: no backend configured; expected one of: inMemory")
+	if c.NonceStore.Signed == nil {
+		return fmt.Errorf("nonceStore: no backend configured; expected one of: signed")
+	}
+	if c.NonceStore.Signed.SigningKeyFile == "" {
+		return fmt.Errorf("nonceStore.signed.signingKeyFile is required")
+	}
+	if c.NonceStore.Signed.TTL <= 0 {
+		return fmt.Errorf("nonceStore.signed.ttl must be a positive duration")
 	}
 	for name, ref := range c.Secrets {
 		if err := ref.Validate(); err != nil {

@@ -1,6 +1,7 @@
 package handlers_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net"
@@ -35,6 +36,19 @@ func mustCIDR(t *testing.T, s string) *net.IPNet {
 	return n
 }
 
+// newTestStore returns a SignedStore with the supplied TTL and a
+// deterministic key. The concrete type is returned so tests can
+// call SetNow when they need to assert time-dependent behaviour.
+func newTestStore(t *testing.T, ttl time.Duration) *store.SignedStore {
+	t.Helper()
+	key := bytes.Repeat([]byte{0x42}, store.MinSignedKeyBytes)
+	s, err := store.NewSignedStore(key, ttl, "")
+	if err != nil {
+		t.Fatalf("NewSignedStore: %v", err)
+	}
+	return s
+}
+
 func mintNonce(t *testing.T, s store.NonceStore, dests ...string) string {
 	t.Helper()
 	nonce, err := s.Mint(&store.Record{
@@ -60,7 +74,7 @@ func newTokenHandler(t *testing.T, s store.NonceStore, registry destinations.Reg
 
 func TestToken_RejectsForeignSourceIP(t *testing.T) {
 	t.Parallel()
-	h := newTokenHandler(t, store.NewInMemoryStore(time.Minute, 0), destinations.Registry{})
+	h := newTokenHandler(t, newTestStore(t, time.Minute), destinations.Registry{})
 	r := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(`{"nonce":"x","destination":"y"}`))
 	r.RemoteAddr = "8.8.8.8:12345"
 	w := httptest.NewRecorder()
@@ -72,7 +86,7 @@ func TestToken_RejectsForeignSourceIP(t *testing.T) {
 
 func TestToken_RejectsUnknownNonce(t *testing.T) {
 	t.Parallel()
-	h := newTokenHandler(t, store.NewInMemoryStore(time.Minute, 0), destinations.Registry{})
+	h := newTokenHandler(t, newTestStore(t, time.Minute), destinations.Registry{})
 	r := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(`{"nonce":"never","destination":"y"}`))
 	r.RemoteAddr = "10.0.0.42:12345"
 	w := httptest.NewRecorder()
@@ -82,13 +96,18 @@ func TestToken_RejectsUnknownNonce(t *testing.T) {
 	}
 }
 
-func TestToken_RejectsAlreadyClaimedNonce(t *testing.T) {
+// TestToken_RejectsExpiredNonce covers the second path through the
+// handler that returns 410 Gone: a token whose exp has passed. The
+// signed backend collapses every validation failure (expired,
+// malformed, bad signature) into ErrNotFound, which the handler
+// surfaces as 410.
+func TestToken_RejectsExpiredNonce(t *testing.T) {
 	t.Parallel()
-	s := store.NewInMemoryStore(time.Minute, 0)
+	s := newTestStore(t, time.Minute)
 	nonce := mintNonce(t, s, "alpha")
-	if _, err := s.Claim(nonce); err != nil {
-		t.Fatalf("first claim: %v", err)
-	}
+	// Fast-forward the verifier's clock so the signed token's exp
+	// claim is in the past.
+	s.SetNow(func() time.Time { return time.Now().Add(time.Hour) })
 
 	h := newTokenHandler(t, s, destinations.Registry{})
 	r := httptest.NewRequest(http.MethodPost, "/token",
@@ -103,7 +122,7 @@ func TestToken_RejectsAlreadyClaimedNonce(t *testing.T) {
 
 func TestToken_RejectsDestinationOutsideGrant(t *testing.T) {
 	t.Parallel()
-	s := store.NewInMemoryStore(time.Minute, 0)
+	s := newTestStore(t, time.Minute)
 	nonce := mintNonce(t, s, "alpha")
 
 	h := newTokenHandler(t, s, destinations.Registry{})
@@ -119,7 +138,7 @@ func TestToken_RejectsDestinationOutsideGrant(t *testing.T) {
 
 func TestToken_RejectsUnknownDestinationName(t *testing.T) {
 	t.Parallel()
-	s := store.NewInMemoryStore(time.Minute, 0)
+	s := newTestStore(t, time.Minute)
 	nonce := mintNonce(t, s, "alpha")
 
 	h := newTokenHandler(t, s, destinations.Registry{})
@@ -135,7 +154,7 @@ func TestToken_RejectsUnknownDestinationName(t *testing.T) {
 
 func TestToken_MintFailureReturns502(t *testing.T) {
 	t.Parallel()
-	s := store.NewInMemoryStore(time.Minute, 0)
+	s := newTestStore(t, time.Minute)
 	nonce := mintNonce(t, s, "alpha")
 
 	h := newTokenHandler(t, s, destinations.Registry{
@@ -153,7 +172,7 @@ func TestToken_MintFailureReturns502(t *testing.T) {
 
 func TestToken_HappyPath(t *testing.T) {
 	t.Parallel()
-	s := store.NewInMemoryStore(time.Minute, 0)
+	s := newTestStore(t, time.Minute)
 	nonce := mintNonce(t, s, "alpha")
 
 	h := newTokenHandler(t, s, destinations.Registry{
@@ -178,7 +197,7 @@ func TestToken_HappyPath(t *testing.T) {
 
 func TestToken_RejectsMalformedBody(t *testing.T) {
 	t.Parallel()
-	h := newTokenHandler(t, store.NewInMemoryStore(time.Minute, 0), destinations.Registry{})
+	h := newTokenHandler(t, newTestStore(t, time.Minute), destinations.Registry{})
 	r := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(`not-json`))
 	r.RemoteAddr = "10.0.0.42:12345"
 	w := httptest.NewRecorder()
