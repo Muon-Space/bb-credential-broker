@@ -1,0 +1,201 @@
+name: main
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.25"
+  REGISTRY: ghcr.io
+  # GHCR image names must be lowercase, so the owner segment is
+  # spelled muon-space rather than the repository's mixed-case
+  # Muon-Space.
+  IMAGE_NAME: muon-space/bb-credential-broker
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Verify go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -race -count=1 ./...
+      - name: Lint
+        uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v9.2.0
+        with:
+          version: v2.12
+          args: --timeout=5m
+
+  build:
+    name: build ${{ matrix.target.platform }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { platform: linux_amd64,    goos: linux,   goarch: amd64, goamd64: "",  goarm: "",  ext: "" }
+          - { platform: linux_amd64_v3, goos: linux,   goarch: amd64, goamd64: v3,  goarm: "",  ext: "" }
+          - { platform: linux_386,      goos: linux,   goarch: "386", goamd64: "",  goarm: "",  ext: "" }
+          - { platform: linux_arm,      goos: linux,   goarch: arm,   goamd64: "",  goarm: "7", ext: "" }
+          - { platform: linux_arm64,    goos: linux,   goarch: arm64, goamd64: "",  goarm: "",  ext: "" }
+          - { platform: darwin_amd64,   goos: darwin,  goarch: amd64, goamd64: "",  goarm: "",  ext: "" }
+          - { platform: darwin_arm64,   goos: darwin,  goarch: arm64, goamd64: "",  goarm: "",  ext: "" }
+          - { platform: freebsd_amd64,  goos: freebsd, goarch: amd64, goamd64: "",  goarm: "",  ext: "" }
+          - { platform: windows_amd64,  goos: windows, goarch: amd64, goamd64: "",  goarm: "",  ext: ".exe" }
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Build ${{ matrix.target.platform }}
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.target.goos }}
+          GOARCH: ${{ matrix.target.goarch }}
+          GOAMD64: ${{ matrix.target.goamd64 }}
+          GOARM: ${{ matrix.target.goarm }}
+        run: |
+          OUT="bb-credential-broker.${{ matrix.target.platform }}${{ matrix.target.ext }}"
+          go build -trimpath -ldflags='-s -w' -o "${OUT}" ./cmd/bb-credential-broker
+          echo "OUT=${OUT}" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bb-credential-broker.${{ matrix.target.platform }}
+          path: ${{ env.OUT }}
+          if-no-files-found: error
+
+  docker:
+    name: docker ${{ matrix.arch.tag }}
+    runs-on: ${{ matrix.arch.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - { platform: linux/amd64, runner: ubuntu-24.04,     tag: linux-amd64 }
+          - { platform: linux/arm64, runner: ubuntu-24.04-arm, tag: linux-arm64 }
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+      - uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set variables
+        id: vars
+        run: |
+          echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
+          echo "image_tag=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+      - uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}-${{ matrix.arch.tag }}
+          platforms: ${{ matrix.arch.platform }}
+          cache-from: type=gha,scope=bb-credential-broker-${{ matrix.arch.tag }}
+          cache-to: type=gha,mode=max,scope=bb-credential-broker-${{ matrix.arch.tag }}
+          provenance: false
+          outputs: type=image,push=true,compression=gzip,compression-level=6,force-compression=true
+          labels: |
+            org.opencontainers.image.created=${{ steps.vars.outputs.build_date }}
+            org.opencontainers.image.version=${{ steps.vars.outputs.image_tag }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.title=bb-credential-broker
+            org.opencontainers.image.description=Mints short-lived per-build identity credentials for Buildbarn workers.
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.licenses=Apache-2.0
+
+  manifest:
+    name: manifest
+    needs: docker
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set variables
+        id: vars
+        run: |
+          echo "image_tag=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+      - name: Push sha and latest manifests
+        run: |
+          FULL_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          TAG=${{ steps.vars.outputs.image_tag }}
+          for ALIAS in ${TAG} latest; do
+            docker manifest create ${FULL_IMAGE}:${ALIAS} \
+              ${FULL_IMAGE}:${TAG}-linux-amd64 \
+              ${FULL_IMAGE}:${TAG}-linux-arm64
+            docker manifest push ${FULL_IMAGE}:${ALIAS}
+          done
+
+  publish:
+    name: publish
+    needs: [lint, build, manifest]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Download release artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          merge-multiple: true
+          path: assets
+      - name: Calculate shasum
+        run: shasum -a 256 assets/* > sha256
+      - name: Set release Git user
+        run: |
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+      - name: Generate release tag
+        id: create_tag
+        run: |
+          BUILD_SCM_REVISION=$(git rev-parse --short HEAD)
+          BUILD_SCM_TIMESTAMP=$(TZ=UTC date --date "@$(git show -s --format=%ct HEAD)" +%Y%m%dT%H%M%SZ)
+          RELEASE_TAG="${BUILD_SCM_TIMESTAMP}-${BUILD_SCM_REVISION}"
+          git tag $RELEASE_TAG
+          git push --follow-tags
+          echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
+      - name: Tag container manifest with release tag
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+          FULL_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          SHA_TAG=${GITHUB_SHA::7}
+          RELEASE_TAG="${{ steps.create_tag.outputs.release_tag }}"
+          docker manifest create ${FULL_IMAGE}:${RELEASE_TAG} \
+            ${FULL_IMAGE}:${SHA_TAG}-linux-amd64 \
+            ${FULL_IMAGE}:${SHA_TAG}-linux-arm64
+          docker manifest push ${FULL_IMAGE}:${RELEASE_TAG}
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        with:
+          files: |
+            assets/*
+            sha256
+          make_latest: true
+          tag_name: ${{ steps.create_tag.outputs.release_tag }}

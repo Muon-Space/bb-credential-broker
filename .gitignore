@@ -1,0 +1,30 @@
+# Build output
+/bin/
+/dist/
+
+# Test output
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Local env / secret leakage
+.env
+.env.local
+*.pem
+*.key
+
+# Go
+vendor/
+
+# Direnv
+.envrc.local
