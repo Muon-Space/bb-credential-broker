@@ -21,6 +21,15 @@ const MinSignedKeyBytes = 32
 // SignedConfig.Issuer is empty.
 const DefaultSignedIssuer = "bb-credential-broker"
 
+// JWT claim names used by SignedStore in addition to the standard
+// RFC 7519 claims (iss, sub, iat, exp, jti). Defined as constants so
+// that Mint and Claim cannot drift independently.
+const (
+	claimIdentityType        = "identity_type"
+	claimIdentityClaims      = "claims"
+	claimGrantedDestinations = "granted_destinations"
+)
+
 // SignedConfig configures the SignedStore backend.
 type SignedConfig struct {
 	// SigningKeyFile is the absolute path to the file holding the
@@ -66,6 +75,7 @@ type SignedStore struct {
 	ttl    time.Duration
 	issuer string
 	now    func() time.Time
+	parser *jwt.Parser
 }
 
 // NewSignedStore constructs a SignedStore from raw key bytes. The
@@ -81,12 +91,23 @@ func NewSignedStore(key []byte, ttl time.Duration, issuer string) (*SignedStore,
 	if issuer == "" {
 		issuer = DefaultSignedIssuer
 	}
-	return &SignedStore{
+	s := &SignedStore{
 		key:    append([]byte(nil), key...),
 		ttl:    ttl,
 		issuer: issuer,
 		now:    time.Now,
-	}, nil
+	}
+	// The parser is invariant per store instance; constructing it
+	// once at startup avoids rebuilding the option chain on every
+	// Claim. The WithTimeFunc closure captures s by reference so
+	// SetNow continues to take effect after construction.
+	s.parser = jwt.NewParser(
+		jwt.WithIssuer(s.issuer),
+		jwt.WithExpirationRequired(),
+		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+		jwt.WithTimeFunc(func() time.Time { return s.now() }),
+	)
+	return s, nil
 }
 
 // SetNow overrides the function used to read the current time. It
@@ -137,14 +158,14 @@ func (s *SignedStore) Mint(rec *Record) (string, error) {
 	}
 
 	claims := jwt.MapClaims{
-		"iss":                  s.issuer,
-		"sub":                  rec.Identity.Principal,
-		"iat":                  now.Unix(),
-		"exp":                  rec.ExpiresAt.Unix(),
-		"jti":                  jti,
-		"identity_type":        string(rec.Identity.Type),
-		"claims":               rec.Identity.Claims,
-		"granted_destinations": rec.AllowedDestinations,
+		"iss":                    s.issuer,
+		"sub":                    rec.Identity.Principal,
+		"iat":                    now.Unix(),
+		"exp":                    rec.ExpiresAt.Unix(),
+		"jti":                    jti,
+		claimIdentityType:        string(rec.Identity.Type),
+		claimIdentityClaims:      rec.Identity.Claims,
+		claimGrantedDestinations: rec.AllowedDestinations,
 	}
 	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	signed, err := tok.SignedString(s.key)
@@ -161,13 +182,7 @@ func (s *SignedStore) Mint(rec *Record) (string, error) {
 // Record. On any validation failure ErrNotFound is returned so that
 // callers cannot distinguish failure modes.
 func (s *SignedStore) Claim(token string) (*Record, error) {
-	parser := jwt.NewParser(
-		jwt.WithIssuer(s.issuer),
-		jwt.WithExpirationRequired(),
-		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
-		jwt.WithTimeFunc(s.now),
-	)
-	parsed, err := parser.Parse(token, func(_ *jwt.Token) (any, error) {
+	parsed, err := s.parser.Parse(token, func(_ *jwt.Token) (any, error) {
 		return s.key, nil
 	})
 	if err != nil || !parsed.Valid {
@@ -179,19 +194,25 @@ func (s *SignedStore) Claim(token string) (*Record, error) {
 		return nil, ErrNotFound
 	}
 
-	identityType, _ := claims["identity_type"].(string)
-	principal, _ := claims["sub"].(string)
-	rawClaims, _ := claims["claims"].(map[string]any)
+	principal, err := claims.GetSubject()
+	if err != nil {
+		return nil, ErrNotFound
+	}
+	exp, err := claims.GetExpirationTime()
+	if err != nil || exp == nil {
+		return nil, ErrNotFound
+	}
 
-	rawDestinations, _ := claims["granted_destinations"].([]any)
+	identityType, _ := claims[claimIdentityType].(string)
+	rawClaims, _ := claims[claimIdentityClaims].(map[string]any)
+
+	rawDestinations, _ := claims[claimGrantedDestinations].([]any)
 	destinations := make([]string, 0, len(rawDestinations))
 	for _, d := range rawDestinations {
 		if str, ok := d.(string); ok {
 			destinations = append(destinations, str)
 		}
 	}
-
-	expFloat, _ := claims["exp"].(float64)
 
 	return &Record{
 		Identity: &auth.Identity{
@@ -200,7 +221,7 @@ func (s *SignedStore) Claim(token string) (*Record, error) {
 			Claims:    rawClaims,
 		},
 		AllowedDestinations: destinations,
-		ExpiresAt:           time.Unix(int64(expFloat), 0),
+		ExpiresAt:           exp.Time,
 	}, nil
 }
 
