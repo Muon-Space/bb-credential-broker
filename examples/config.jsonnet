@@ -47,10 +47,21 @@
     ],
   },
 
+  // The signed nonce store is stateless: tokens issued by one broker
+  // replica are valid for any other replica that holds the same
+  // signing key. This allows the broker to scale horizontally without
+  // a shared backend. The trade-off is that the strict single-use
+  // guarantee of an in-memory store is relaxed to "limited-use within
+  // the TTL window".
+  //
+  // The signing key is read from disk at startup. Operators typically
+  // mount the file from a Kubernetes Secret. Generate the key with
+  // a tool such as `openssl rand 32 > key`; the broker requires at
+  // least 32 bytes of key material.
   nonceStore: {
-    inMemory: {
-      ttl:     '15m',
-      maxSize: 100000,
+    signed: {
+      signingKeyFile: '/etc/broker/signing-key',
+      ttl:            '5m',
     },
   },
 

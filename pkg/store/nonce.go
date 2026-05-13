@@ -1,31 +1,26 @@
 // Package store contains the broker's nonce store. A nonce is a
-// short-lived, single-use token issued by /delegate and surrendered
-// to /token in exchange for a destination-specific credential.
+// short-lived token issued by /delegate and surrendered to /token in
+// exchange for a destination-specific credential. Implementations
+// vary in the backing storage strategy; see the SignedStore type for
+// the production backend.
 package store
 
 import (
-	"crypto/rand"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"slices"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/auth"
 )
 
-// Errors returned by NonceStore implementations.
-var (
-	// ErrNotFound is returned when the requested nonce is not
-	// present in the store. /token responds with 410 Gone.
-	ErrNotFound = errors.New("nonce: not found or expired")
-
-	// ErrAlreadyClaimed is returned when a previously valid nonce
-	// has already been consumed. /token responds with 410 Gone.
-	ErrAlreadyClaimed = errors.New("nonce: already claimed")
-)
+// ErrNotFound is returned when the supplied token is not recognised
+// or has expired. /token responds with 410 Gone. Implementations
+// should also return ErrNotFound for any failure that the caller is
+// not expected to be able to disambiguate (bad signature, malformed
+// payload, wrong issuer); doing so prevents callers from probing the
+// backend's internals.
+var ErrNotFound = errors.New("nonce: not found or expired")
 
 // Record is the payload stored against a nonce. It captures the
 // caller's resolved Identity at the moment of /delegate, the set of
@@ -54,61 +49,46 @@ func (r *Record) AllowsDestination(name string) bool {
 	return slices.Contains(r.AllowedDestinations, name)
 }
 
-// NonceStore is the interface implemented by both the production
-// in-memory store and any future persistent backend.
-//
-// Implementations must guarantee that Claim returns ErrAlreadyClaimed
-// for every concurrent or subsequent call after the first successful
-// claim of a given nonce, even when calls race across goroutines.
+// NonceStore is the interface implemented by every nonce-store
+// backend. Implementations must be safe for concurrent use across
+// multiple goroutines.
 type NonceStore interface {
-	// Mint allocates a new nonce, stores rec under it, and
-	// returns the freshly minted nonce string. The returned
-	// string is opaque and contains enough entropy to resist
-	// brute-force enumeration.
+	// Mint allocates a new nonce, associates rec with it and
+	// returns the freshly minted token string. The returned
+	// string is opaque to the caller.
 	Mint(rec *Record) (string, error)
 
-	// Claim atomically marks the nonce as consumed and returns
-	// the associated Record. It returns ErrNotFound if the nonce
-	// is unknown or has already expired, and ErrAlreadyClaimed
-	// if it has been previously consumed.
-	Claim(nonce string) (*Record, error)
+	// Claim returns the Record associated with token. It returns
+	// ErrNotFound if the token is unknown, expired or otherwise
+	// invalid.
+	Claim(token string) (*Record, error)
 }
 
-// Config selects a NonceStore implementation. Exactly one of the
+// Config selects a NonceStore backend. Exactly one of the
 // type-specific fields must be set.
 type Config struct {
-	// InMemory selects the process-local in-memory store.
-	InMemory *InMemoryConfig `json:"inMemory,omitempty"`
-}
-
-// InMemoryConfig configures the in-memory NonceStore.
-type InMemoryConfig struct {
-	// TTL is the maximum lifetime of an unclaimed nonce. Mint
-	// rejects requests with no TTL configured.
-	TTL Duration `json:"ttl"`
-
-	// MaxSize is an upper bound on the number of nonces held in
-	// memory at any one time. When the store reaches MaxSize, the
-	// oldest unclaimed nonce is discarded to make room. A
-	// non-positive value disables the bound.
-	MaxSize int `json:"maxSize,omitempty"`
+	// Signed selects the stateless signed-token backend. Tokens
+	// are JWTs signed with a shared HMAC key; any replica can
+	// validate any other replica's tokens.
+	Signed *SignedConfig `json:"signed,omitempty"`
 }
 
 // New constructs a NonceStore from cfg.
 func New(cfg Config) (NonceStore, error) {
 	switch {
-	case cfg.InMemory != nil:
-		if cfg.InMemory.TTL <= 0 {
-			return nil, fmt.Errorf("inMemory.ttl must be a positive duration")
+	case cfg.Signed != nil:
+		key, err := LoadSignedKey(cfg.Signed.SigningKeyFile)
+		if err != nil {
+			return nil, err
 		}
-		return NewInMemoryStore(time.Duration(cfg.InMemory.TTL), cfg.InMemory.MaxSize), nil
+		return NewSignedStore(key, time.Duration(cfg.Signed.TTL), cfg.Signed.Issuer)
 	default:
-		return nil, fmt.Errorf("nonce store has no recognised backend; expected one of: inMemory")
+		return nil, fmt.Errorf("nonce store has no recognised backend; expected one of: signed")
 	}
 }
 
 // Duration is a time.Duration that round-trips through JSON as a
-// Go-style duration string (for example "15m"). It exists so that
+// Go-style duration string (for example "5m"). It exists so that
 // configuration files can express durations naturally.
 type Duration time.Duration
 
@@ -125,92 +105,4 @@ func (d *Duration) UnmarshalJSON(data []byte) error {
 		return nil
 	}
 	return fmt.Errorf("duration: expected JSON string, got %s", string(data))
-}
-
-// InMemoryStore is the default NonceStore. It holds nonces in a map
-// guarded by a mutex and discards expired entries lazily on Claim
-// and during Mint when MaxSize is reached.
-type InMemoryStore struct {
-	ttl     time.Duration
-	maxSize int
-
-	mu      sync.Mutex
-	entries map[string]*entry
-}
-
-type entry struct {
-	rec     *Record
-	claimed atomic.Bool
-}
-
-// NewInMemoryStore constructs an InMemoryStore that retains unclaimed
-// nonces for up to ttl. When maxSize is positive, the oldest expired
-// entry is reaped on each Mint when the map exceeds the bound.
-func NewInMemoryStore(ttl time.Duration, maxSize int) *InMemoryStore {
-	return &InMemoryStore{
-		ttl:     ttl,
-		maxSize: maxSize,
-		entries: map[string]*entry{},
-	}
-}
-
-// nonceLength is the number of random bytes that back a nonce string.
-// 24 bytes encodes to 32 base64-url characters and yields 192 bits of
-// entropy, which is more than enough to render brute-force enumeration
-// infeasible regardless of /token rate-limiting.
-const nonceLength = 24
-
-// Mint implements NonceStore.
-func (s *InMemoryStore) Mint(rec *Record) (string, error) {
-	if rec == nil {
-		return "", fmt.Errorf("nonce: cannot mint a nil record")
-	}
-	if rec.ExpiresAt.IsZero() {
-		rec.ExpiresAt = time.Now().Add(s.ttl)
-	}
-
-	buf := make([]byte, nonceLength)
-	if _, err := rand.Read(buf); err != nil {
-		return "", fmt.Errorf("nonce: read random: %w", err)
-	}
-	nonce := base64.RawURLEncoding.EncodeToString(buf)
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.reapExpiredLocked()
-	if s.maxSize > 0 && len(s.entries) >= s.maxSize {
-		return "", fmt.Errorf("nonce: store is at capacity")
-	}
-	s.entries[nonce] = &entry{rec: rec}
-	return nonce, nil
-}
-
-// Claim implements NonceStore.
-func (s *InMemoryStore) Claim(nonce string) (*Record, error) {
-	s.mu.Lock()
-	e, ok := s.entries[nonce]
-	s.mu.Unlock()
-	if !ok {
-		return nil, ErrNotFound
-	}
-	if time.Now().After(e.rec.ExpiresAt) {
-		s.mu.Lock()
-		delete(s.entries, nonce)
-		s.mu.Unlock()
-		return nil, ErrNotFound
-	}
-	if !e.claimed.CompareAndSwap(false, true) {
-		return nil, ErrAlreadyClaimed
-	}
-	return e.rec, nil
-}
-
-func (s *InMemoryStore) reapExpiredLocked() {
-	now := time.Now()
-	for k, e := range s.entries {
-		if now.After(e.rec.ExpiresAt) {
-			delete(s.entries, k)
-		}
-	}
 }
