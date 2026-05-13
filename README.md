@@ -197,6 +197,24 @@ Standard Go runtime metrics (`go_gc_duration_seconds`, `go_goroutines`,
 etc.) are exposed alongside the broker collectors via the same
 endpoint.
 
+### Audit log
+
+Every `/delegate` and `/token` request emits a single JSON line on
+stdout, suitable for ingestion by the cluster's log-collection stack.
+Each record carries the operation (`delegate` or `token`), the
+resolved identity type and principal, the destination (for `/token`),
+the granted destinations (for `/delegate`), the success flag, and on
+failure the underlying reason. Token values, secret material and
+request bodies never appear.
+
+The error string for `/token` rejections preserves the underlying
+reason from the signed-token validator (`token is expired`,
+`signing method HS512 is invalid`, `token has invalid issuer`, etc.)
+even though the HTTP response to the caller is uniformly `410 Gone`
+with body `nonce is not valid`. Operators can therefore distinguish
+routine token expiry from active forgery attempts in the audit log
+without leaking the distinction to clients.
+
 ## License
 
 Apache 2.0. See [`LICENSE`](./LICENSE).
