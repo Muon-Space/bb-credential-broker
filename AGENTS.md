@@ -9,7 +9,7 @@ cmd/bb-credential-broker/      Binary entry point.
 pkg/app/                       Top-level dependency wiring.
 pkg/config/                    Configuration schema and loader (Jsonnet).
 pkg/auth/                      JWT validation and the Identity type.
-pkg/store/                     Nonce store (interface + in-memory implementation).
+pkg/store/                     Nonce store (interface + signed-JWT implementation).
 pkg/secrets/                   Secret loader (interface + AWS Secrets Manager implementation).
 pkg/policy/                    Per-identity policy resolver.
 pkg/destinations/              Destination interface and registry.

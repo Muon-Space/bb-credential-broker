@@ -32,8 +32,10 @@ type BearerValidator interface {
 //
 // The handler validates the caller's bearer JWT, resolves the
 // caller's Identity, asks the policy engine which destinations the
-// caller is allowed to mint tokens for, and mints a single-use
-// nonce that the caller can subsequently exchange via /token.
+// caller is allowed to mint tokens for, and mints a short-lived
+// delegation token that the caller can subsequently exchange via
+// /token. The token's exact form (opaque nonce, signed JWT, etc.)
+// depends on the configured NonceStore backend.
 type DelegateHandler struct {
 	parser  BearerValidator
 	policy  policy.Engine
