@@ -27,10 +27,12 @@ Two endpoints, both speaking JSON over HTTP:
   and returns the freshly minted credential.
 
 The broker has no compiled-in knowledge of any particular destination
-service. It contains a single generic destination type, `httpTokenExchange`,
-that is parameterised entirely from the operator's configuration. Adding
-support for a new destination protocol is a configuration change rather
-than a code change.
+service. It ships two generic destination types parameterised entirely
+from the operator's configuration: `httpTokenExchange`, which expresses
+every mint flow as a templated HTTP request, and `staticSecret`, which
+dispenses a credential read verbatim from a file on disk. Adding support
+for a new destination protocol is a configuration change rather than a
+code change.
 
 ## Configuration
 
@@ -49,10 +51,18 @@ The top-level structure is:
   nonceStore: { signed: { signingKeyFile: '/etc/broker/signing-key', ttl: '5m' } },
   secrets:    { 'name-of-secret': { awsSecretsManager: { arn, field } }, ... },
   destinations: {
-    'destination-name': {
+    'token-exchange-destination': {
       httpTokenExchange: {
         request:  { method, url, headers, body },
         response: { tokenJsonPath, expiresInJsonPath OR expiresAtJsonPath },
+      },
+    },
+    'static-secret-destination': {
+      staticSecret: {
+        file:     '/etc/broker/destinations/<name>',  // K8s Secret mount
+        scheme:   'bearer' | 'basic',                 // optional, default 'bearer'
+        username: '<basic-auth username>',            // optional, used when scheme='basic'
+        cacheTtl: '<go duration>',                    // optional, default '1h'
       },
     },
     ...
@@ -81,6 +91,50 @@ expressions; the innermost expression is evaluated first.
 | `${now+DUR}` | Unix epoch seconds plus a Go-style duration. | `${now+540s}`, `${now+10m}` |
 | `${b64:STR}` | Base64 encode the argument. | `${b64:user:pass}` |
 | `${env:VAR}` | Read an environment variable. Substituted at start-up rather than per request. | `${env:AWS_REGION}` |
+
+### Static-secret destinations
+
+`httpTokenExchange` covers any destination whose API exposes a token-mint
+endpoint. For systems that genuinely require a long-lived credential —
+typically a personal access token for a service whose API does not
+implement OIDC token-exchange — use a `staticSecret` destination instead.
+
+The broker reads the credential from a file on disk on every `Mint`
+call. The intended source is a Kubernetes Secret mounted into the
+broker's pod; operators are free to populate the underlying Secret from
+any backend already in use (External Secrets Operator syncing from AWS
+Secrets Manager, CSI Secrets Store, Sealed Secrets, plain `kubectl`).
+The broker itself only needs read access to the file at startup —
+adding a new static-secret destination is an operator-side change to
+the pod's volume mounts plus a new entry in the broker's `destinations`
+map; no broker code change.
+
+Per-identity policy gating still applies — a `staticSecret` destination
+is only dispensed to callers whose `Identity` matches the policy below
+— and every dispense is recorded in the audit log along with the
+calling principal. Compared to "project the secret into every worker
+pod" (Phase 0 in the design), the broker's role is to enforce
+authorization on the dispense and to keep the credential out of every
+non-broker pod's environment until it is actually requested.
+
+The `/token` response carries the credential in the standard `token`
+field. When `scheme: 'basic'` is configured, an additional `username`
+field is populated and the worker-side credential helper should
+construct an `Authorization: Basic base64(username:token)` header (this
+is the convention git, npm, and OCI registries use when authenticating
+with a personal access token). When `scheme: 'bearer'` (the default)
+the `username` field is omitted and the helper should send
+`Authorization: Bearer <token>`.
+
+**Trade-off worth flagging.** A static credential is structurally
+weaker than a per-build minted token: it is long-lived, leaks have
+broader blast radius, and per-action revocation is impossible. Use this
+destination type only when the upstream service forces it. Scope the
+underlying credential as tightly as the upstream API allows (read-only,
+single-resource scope where possible) and rotate the underlying Secret
+out of band on whatever cadence your threat model demands. The broker
+re-reads the file on every `Mint`, so the next dispense after rotation
+returns the new value with no broker restart.
 
 ### Nonce store
 

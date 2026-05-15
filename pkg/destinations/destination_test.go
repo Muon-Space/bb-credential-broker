@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -149,6 +151,89 @@ func TestBuildRegistry_InstrumentsMintCalls(t *testing.T) {
 	}
 	if count != 1 {
 		t.Errorf("mint_requests_total series count: got %d, want 1", count)
+	}
+}
+
+// TestBuildRegistry_StaticSecretHappyPath exercises the staticSecret
+// dispatch end to end: a configured destination is constructed,
+// looked up, minted, and the resulting Token carries the file's
+// contents along with the configured scheme and username.
+func TestBuildRegistry_StaticSecretHappyPath(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "pat")
+	if err := os.WriteFile(path, []byte("ghp_secret_value\n"), 0o600); err != nil {
+		t.Fatalf("write secret: %v", err)
+	}
+	raw := map[string]json.RawMessage{
+		"ghe-pat": json.RawMessage(`{
+			"staticSecret": {
+				"file":     "` + path + `",
+				"scheme":   "basic",
+				"username": "x-access-token",
+				"cacheTtl": "30m"
+			}
+		}`),
+	}
+	reg, err := destinations.BuildRegistry(raw, destinations.Dependencies{
+		Secrets:      secrets.NewMapLoader(),
+		NamedSecrets: map[string]secrets.SecretRef{},
+	})
+	if err != nil {
+		t.Fatalf("BuildRegistry: %v", err)
+	}
+	tok, err := reg.Lookup("ghe-pat").Mint(context.Background(),
+		&auth.Identity{Type: auth.IdentityTypeCI, Principal: "p"})
+	if err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+	if tok.Value != "ghp_secret_value" {
+		t.Errorf("Value: got %q, want %q", tok.Value, "ghp_secret_value")
+	}
+	if tok.Scheme != "basic" {
+		t.Errorf("Scheme: got %q, want %q", tok.Scheme, "basic")
+	}
+	if tok.Username != "x-access-token" {
+		t.Errorf("Username: got %q, want %q", tok.Username, "x-access-token")
+	}
+}
+
+func TestBuildRegistry_StaticSecretMissingFileIsRejectedAtBuild(t *testing.T) {
+	t.Parallel()
+	raw := map[string]json.RawMessage{
+		"ghe-pat": json.RawMessage(`{
+			"staticSecret": {"file": "/does/not/exist"}
+		}`),
+	}
+	_, err := destinations.BuildRegistry(raw, destinations.Dependencies{})
+	if err == nil {
+		t.Fatal("expected error for missing secret file at build time, got nil")
+	}
+	if !strings.Contains(err.Error(), "ghe-pat") {
+		t.Errorf("error %q should mention destination name", err.Error())
+	}
+}
+
+func TestBuildRegistry_RejectsMultipleDiscriminators(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "pat")
+	if err := os.WriteFile(path, []byte("ghp_x"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	raw := map[string]json.RawMessage{
+		"both": json.RawMessage(`{
+			"httpTokenExchange": {
+				"request":  {"method": "POST", "url": "https://example.com/"},
+				"response": {"tokenJsonPath": "access_token"}
+			},
+			"staticSecret": {"file": "` + path + `"}
+		}`),
+	}
+	_, err := destinations.BuildRegistry(raw, destinations.Dependencies{
+		Secrets:      secrets.NewMapLoader(),
+		NamedSecrets: map[string]secrets.SecretRef{},
+	})
+	if err == nil {
+		t.Fatal("expected error for multiple discriminators, got nil")
 	}
 }
 
