@@ -149,6 +149,41 @@
         },
       },
     },
+
+    // staticSecret dispenses a credential read verbatim from a file
+    // on disk. The intended source is a Kubernetes Secret mounted
+    // into the broker's pod; operators are free to populate the
+    // underlying Secret from any backend (External Secrets Operator
+    // syncing from AWS Secrets Manager, CSI Secrets Store, Sealed
+    // Secrets, manual kubectl). The broker itself only needs read
+    // access to the file at startup.
+    //
+    // The destination is appropriate for credentials that genuinely
+    // cannot be minted on demand — typically long-lived personal
+    // access tokens for systems whose API does not expose an OIDC
+    // token-exchange flow (GitHub Enterprise package reads, for
+    // example, accept only PATs or GitHub Actions tokens; the broker
+    // cannot mint the latter). Per-identity policy gating still
+    // applies — only callers whose Identity matches the policy below
+    // can request the credential — and every dispense is recorded in
+    // the audit log.
+    'ghe-packages-pat': {
+      staticSecret: {
+        // Mount your K8s Secret at this path. Example pod spec:
+        //   volumes:
+        //     - name: ghe-pat
+        //       secret: { secretName: ghe-packages-pat }
+        //   volumeMounts:
+        //     - name: ghe-pat
+        //       mountPath: /etc/broker/destinations/ghe-packages-pat
+        //       subPath:   token
+        //       readOnly:  true
+        file:     '/etc/broker/destinations/ghe-packages-pat',
+        scheme:   'basic',
+        username: 'x-access-token',
+        cacheTtl: '1h',
+      },
+    },
   },
 
   // Per-identity policy. Each match key is a dotted path into the
@@ -165,7 +200,7 @@
     ci: [
       {
         match:               { 'claims.repository': { equals: 'example-org/example-repo' } },
-        allowedDestinations: ['artifactory-prod', 'github-app'],
+        allowedDestinations: ['artifactory-prod', 'github-app', 'ghe-packages-pat'],
       },
       {
         match:               { 'claims.repository': { glob: 'example-org/*' } },

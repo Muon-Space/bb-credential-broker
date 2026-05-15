@@ -59,6 +59,12 @@ type tokenResponse struct {
 	Token     string    `json:"token"`
 	ExpiresAt time.Time `json:"expires_at,omitempty"`
 	Scheme    string    `json:"scheme"`
+
+	// Username is set only by destinations that pair the token
+	// with a basic-auth username (typically the static-secret
+	// type when dispensing a personal access token to git or an
+	// OCI registry). Bearer-token destinations leave it empty.
+	Username string `json:"username,omitempty"`
 }
 
 // ServeHTTP implements http.Handler. The bulk of the request flow
@@ -151,6 +157,7 @@ func (h *TokenHandler) serve(w http.ResponseWriter, r *http.Request) (int, strin
 		Token:     tok.Value,
 		ExpiresAt: tok.ExpiresAt,
 		Scheme:    tok.Scheme,
+		Username:  tok.Username,
 	})
 	return http.StatusOK, identityType, req.Destination
 }

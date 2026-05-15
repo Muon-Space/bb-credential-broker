@@ -4,8 +4,10 @@
 // that maps the operator-supplied configuration to the underlying
 // destination type implementations.
 //
-// The broker ships a single destination type, httpTokenExchange,
-// that expresses every mint flow as a templated HTTP request. New
+// The broker ships two destination types: httpTokenExchange, which
+// expresses every mint flow as a templated HTTP request, and
+// staticSecret, which dispenses a credential read from a file on
+// disk for systems whose API does not expose an OIDC exchange. New
 // types are added by appending a new case to BuildRegistry and a
 // new sub-package under destinations/.
 package destinations
@@ -18,6 +20,7 @@ import (
 
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/auth"
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/destinations/httptokenexchange"
+	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/destinations/staticsecret"
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/metrics"
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/secrets"
 )
@@ -54,6 +57,15 @@ type Token struct {
 	// passes this through verbatim; downstream tools may use it
 	// to construct the appropriate Authorization header.
 	Scheme string
+
+	// Username is the basic-auth username paired with Value when
+	// Scheme is "basic". It is empty for bearer-token destinations
+	// and is set by destination types whose target service expects
+	// a username (typically the static-secret type when dispensing
+	// a personal access token to git or an OCI registry, where
+	// the convention is to use a placeholder such as
+	// "x-access-token").
+	Username string
 }
 
 // Registry holds the constructed Destinations keyed by the operator-
@@ -116,6 +128,7 @@ func BuildRegistry(raw map[string]json.RawMessage, deps Dependencies) (Registry,
 // in buildOne.
 type destinationConfig struct {
 	HTTPTokenExchange *httptokenexchange.Config `json:"httpTokenExchange,omitempty"`
+	StaticSecret      *staticsecret.Config      `json:"staticSecret,omitempty"`
 }
 
 // buildOne dispatches a single destinations entry to the appropriate
@@ -129,6 +142,8 @@ func buildOne(name string, msg json.RawMessage, deps Dependencies) (Destination,
 		return nil, fmt.Errorf("decode: %w", err)
 	}
 	switch {
+	case cfg.HTTPTokenExchange != nil && cfg.StaticSecret != nil:
+		return nil, fmt.Errorf("multiple destination type discriminators set; expected exactly one")
 	case cfg.HTTPTokenExchange != nil:
 		impl, err := httptokenexchange.New(name, cfg.HTTPTokenExchange, httptokenexchange.Dependencies{
 			Secrets:      deps.Secrets,
@@ -138,8 +153,14 @@ func buildOne(name string, msg json.RawMessage, deps Dependencies) (Destination,
 			return nil, err
 		}
 		return &httpTokenExchangeAdapter{impl: impl}, nil
+	case cfg.StaticSecret != nil:
+		impl, err := staticsecret.New(name, cfg.StaticSecret)
+		if err != nil {
+			return nil, err
+		}
+		return &staticSecretAdapter{impl: impl}, nil
 	default:
-		return nil, fmt.Errorf("no destination type discriminator set; expected one of: httpTokenExchange")
+		return nil, fmt.Errorf("no destination type discriminator set; expected one of: httpTokenExchange, staticSecret")
 	}
 }
 
@@ -165,6 +186,27 @@ func (a *httpTokenExchangeAdapter) Mint(ctx context.Context, identity *auth.Iden
 		Value:     t.Value,
 		ExpiresAt: t.ExpiresAt,
 		Scheme:    scheme,
+	}, nil
+}
+
+// staticSecretAdapter converts the package-internal Token shape
+// returned by staticsecret.Impl.Mint into the public Token type.
+// Mirrors httpTokenExchangeAdapter; the indirection exists for the
+// same import-cycle reason.
+type staticSecretAdapter struct {
+	impl *staticsecret.Impl
+}
+
+func (a *staticSecretAdapter) Mint(ctx context.Context, identity *auth.Identity) (*Token, error) {
+	t, err := a.impl.Mint(ctx, identity)
+	if err != nil {
+		return nil, err
+	}
+	return &Token{
+		Value:     t.Value,
+		ExpiresAt: t.ExpiresAt,
+		Scheme:    t.Scheme,
+		Username:  t.Username,
 	}, nil
 }
 
