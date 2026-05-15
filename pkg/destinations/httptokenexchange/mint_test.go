@@ -320,6 +320,41 @@ func TestMint_WrongStatusReturnsError(t *testing.T) {
 	if !strings.Contains(err.Error(), "500") {
 		t.Errorf("error %q should mention the status", err.Error())
 	}
+	// The error must include the upstream response body so that
+	// audit-log readers can diagnose unexpected upstream rejections
+	// without re-running the request locally.
+	if !strings.Contains(err.Error(), "oops") {
+		t.Errorf("error %q should include the upstream response body", err.Error())
+	}
+}
+
+// TestMint_WrongStatusTruncatesLargeBody pins the 1 KiB cap on the
+// body snippet included in the error so that a misbehaving upstream
+// returning megabytes of HTML cannot make the audit-log line
+// unworkable.
+func TestMint_WrongStatusTruncatesLargeBody(t *testing.T) {
+	t.Parallel()
+	body := strings.Repeat("x", 64*1024)
+	fake := newFakeDestination(http.StatusForbidden, body)
+	defer fake.Close()
+
+	cfg := &httptokenexchange.Config{
+		Request:  httptokenexchange.RequestConfig{Method: "POST", URL: fake.URL() + "/"},
+		Response: httptokenexchange.ResponseConfig{TokenJSONPath: "token"},
+	}
+	impl, err := httptokenexchange.New("test", cfg, newTestDeps())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = impl.Mint(context.Background(), newTestIdentity())
+	if err == nil {
+		t.Fatal("expected error for 403 response, got nil")
+	}
+	// Allow some slack for the surrounding error-message bytes;
+	// the cap on the body snippet itself is 1024.
+	if got := len(err.Error()); got > 2048 {
+		t.Errorf("error length %d exceeds expected cap; body should have been truncated", got)
+	}
 }
 
 func TestMint_TokenFieldMissing(t *testing.T) {

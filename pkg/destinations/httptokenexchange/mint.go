@@ -55,7 +55,18 @@ func (i *Impl) Mint(ctx context.Context, identity *auth.Identity) (*Token, error
 		expectStatus = http.StatusOK
 	}
 	if resp.StatusCode != expectStatus {
-		return nil, fmt.Errorf("%s: response status %d, want %d", i.name, resp.StatusCode, expectStatus)
+		// Include a truncated response body in the error so that
+		// audit-log readers can diagnose upstream rejection without
+		// re-running the request locally with verbose logging. The
+		// body is bounded to 1 KiB; that is enough for every
+		// upstream auth error message we have seen and small enough
+		// to keep the audit-log line workable. Any token material
+		// the broker sent in the request is in the request, not in
+		// the response, so this does not widen the credential leak
+		// surface.
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, fmt.Errorf("%s: response status %d, want %d; body: %s",
+			i.name, resp.StatusCode, expectStatus, strings.TrimSpace(string(snippet)))
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
