@@ -91,6 +91,7 @@ expressions; the innermost expression is evaluated first.
 | `${now+DUR}` | Unix epoch seconds plus a Go-style duration. | `${now+540s}`, `${now+10m}` |
 | `${b64:STR}` | Base64 encode the argument. | `${b64:user:pass}` |
 | `${env:VAR}` | Read an environment variable. Substituted at start-up rather than per request. | `${env:AWS_REGION}` |
+| `${default:EXPR:FALLBACK}` | Evaluate `EXPR`; return `FALLBACK` if `EXPR` fails for any reason (missing variable, missing secret, file read error, etc.). Both arguments are templates and may contain nested `${...}` expressions. | `${default:${identity.claims.classification}:unclassified}` |
 
 ### Static-secret destinations
 

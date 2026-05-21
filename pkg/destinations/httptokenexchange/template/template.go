@@ -58,6 +58,19 @@ type callExpr struct {
 }
 
 func (c *callExpr) eval(ctx context.Context, scope *Scope, sb *strings.Builder) error {
+	// Lazy functions take their unevaluated argument templates so
+	// they can make their own decisions about evaluation order
+	// and error tolerance. The lazy registry is checked first;
+	// names registered in both fall through to the lazy form,
+	// though in practice the two registries have disjoint keys.
+	if lazy, ok := scope.LazyFuncs[c.name]; ok {
+		out, err := lazy(ctx, scope, c.args)
+		if err != nil {
+			return fmt.Errorf("template: %s: %w", c.name, err)
+		}
+		sb.WriteString(out)
+		return nil
+	}
 	fn, ok := scope.Funcs[c.name]
 	if !ok {
 		return fmt.Errorf("template: unknown function %q", c.name)
