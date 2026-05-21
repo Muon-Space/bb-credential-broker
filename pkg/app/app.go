@@ -43,7 +43,7 @@ type App struct {
 	policy        policy.Engine
 	store         store.NonceStore
 	registry      destinations.Registry
-	auditLogger   *audit.Logger
+	auditLogger   audit.Logger
 	metrics       *brokermetrics.Metrics
 	promRegistry  *prometheus.Registry
 	jwksRefresh   time.Duration

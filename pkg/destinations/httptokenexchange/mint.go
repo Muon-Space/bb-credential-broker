@@ -10,9 +10,16 @@ import (
 	"strings"
 	"time"
 
+	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/audit"
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/auth"
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/destinations/httptokenexchange/template"
 )
+
+// upstreamExcerptBytes bounds the response-body prefix the audit
+// log records on upstream failure. 256 bytes is enough for every
+// upstream auth-error message we have observed and small enough to
+// keep an audit-log line workable.
+const upstreamExcerptBytes = 256
 
 // Mint executes the destination's templated HTTP exchange against
 // the upstream service and returns the resulting Token.
@@ -39,12 +46,29 @@ func (i *Impl) Mint(ctx context.Context, identity *auth.Identity) (*Token, error
 		return nil, fmt.Errorf("%s: register now offsets: %w", i.name, err)
 	}
 
+	mintAudit := audit.MintAuditFromContext(ctx)
+
 	req, err := i.buildRequest(ctx, scope)
 	if err != nil {
 		return nil, fmt.Errorf("%s: build request: %w", i.name, err)
 	}
+	// Record the resolved upstream URL before dispatching the
+	// request so the audit log captures it even when the
+	// transport call fails (the upstream service was never
+	// reached but the broker did attempt to mint against it).
+	if mintAudit != nil {
+		mintAudit.UpstreamURL = req.URL.String()
+	}
 
+	start := time.Now()
 	resp, err := i.client.Do(req)
+	elapsed := time.Since(start)
+	if mintAudit != nil {
+		mintAudit.UpstreamDuration = elapsed
+		if resp != nil {
+			mintAudit.UpstreamStatusCode = resp.StatusCode
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("%s: outbound request: %w", i.name, err)
 	}
@@ -65,8 +89,12 @@ func (i *Impl) Mint(ctx context.Context, identity *auth.Identity) (*Token, error
 		// the response, so this does not widen the credential leak
 		// surface.
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		trimmed := strings.TrimSpace(string(snippet))
+		if mintAudit != nil {
+			mintAudit.UpstreamResponseExcerpt = truncate(trimmed, upstreamExcerptBytes)
+		}
 		return nil, fmt.Errorf("%s: response status %d, want %d; body: %s",
-			i.name, resp.StatusCode, expectStatus, strings.TrimSpace(string(snippet)))
+			i.name, resp.StatusCode, expectStatus, trimmed)
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
@@ -84,6 +112,19 @@ func (i *Impl) Mint(ctx context.Context, identity *auth.Identity) (*Token, error
 		return nil, fmt.Errorf("%s: %w", i.name, err)
 	}
 	return tok, nil
+}
+
+// truncate returns s if its length is within n; otherwise it
+// returns the first n bytes of s. The truncation is byte-wise
+// rather than rune-wise because the audit-log consumer treats
+// excerpts as opaque diagnostic strings and the bound exists to
+// keep the line workable, not to preserve human-readable
+// substrings.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
 }
 
 // buildRequest evaluates the URL, header and body templates and

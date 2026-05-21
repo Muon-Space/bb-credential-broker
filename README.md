@@ -278,20 +278,97 @@ endpoint.
 ### Audit log
 
 Every `/delegate` and `/token` request emits a single JSON line on
-stdout, suitable for ingestion by the cluster's log-collection stack.
-Each record carries the operation (`delegate` or `token`), the
-resolved identity type and principal, the destination (for `/token`),
-the granted destinations (for `/delegate`), the success flag, and on
-failure the underlying reason. Token values, secret material and
-request bodies never appear.
+stdout. The line is written synchronously and is flushed before the
+HTTP response is sent so an audit entry is never lost to a caller
+disconnect mid-request.
 
-The error string for `/token` rejections preserves the underlying
-reason from the signed-token validator (`token is expired`,
-`signing method HS512 is invalid`, `token has invalid issuer`, etc.)
-even though the HTTP response to the caller is uniformly `410 Gone`
-with body `nonce is not valid`. Operators can therefore distinguish
-routine token expiry from active forgery attempts in the audit log
-without leaking the distinction to clients.
+Token values, secret material and request bodies never appear in
+audit output. The HTTP responses returned to callers stay opaque —
+the audit log retains the operator-readable detail under
+`denial_reason`.
+
+#### Schema
+
+The published shape is a stable interface; downstream Loki / Grafana
+dashboards consume it. Any change to a field that is not strictly
+additive constitutes a schema break and requires a coordinated
+rollout.
+
+`/delegate` (one line per request):
+
+```json
+{
+  "ts": "2026-05-21T10:23:45.123Z",
+  "event": "delegate",
+  "identity": {
+    "type": "ci",
+    "principal": "repo:owner/repo:ref:refs/heads/main",
+    "claims": { /* every claim from the validated JWT, verbatim */ }
+  },
+  "result": "granted",
+  "granted_destinations": ["artifactory", "github-app"],
+  "delegation_token_jti": "<jti claim from issued JWT>",
+  "delegation_token_exp": "2026-05-21T10:28:45Z"
+}
+```
+
+On denial: `"result": "denied"`, `identity` may be `null` for
+pre-resolution rejections, and `denial_reason` carries one of the
+canonical reasons documented below. `identity.claims` is always an
+object (never `null`); the empty object indicates a JWT carrying no
+claims beyond `iss`/`sub`/`aud`/`exp`/`iat`.
+
+`/token` (one line per request):
+
+```json
+{
+  "ts": "2026-05-21T10:24:01.456Z",
+  "event": "token",
+  "identity": { /* same shape as above */ },
+  "destination": "artifactory",
+  "result": "success",
+  "upstream_url": "https://artifactory.example.com/access/api/v1/oidc/token",
+  "upstream_status": 200,
+  "upstream_duration_ms": 123,
+  "token_expires_at": "2026-05-21T10:39:01Z"
+}
+```
+
+On failure: `"result": "failure"`, `denial_reason` carries the
+canonical reason, and `upstream_response_excerpt` carries the
+first 256 bytes of the upstream response body (only for upstream
+non-success status codes).
+
+Destinations that perform no upstream call — the `staticSecret`
+type — omit the `upstream_url`, `upstream_status`,
+`upstream_duration_ms` and `upstream_response_excerpt` fields
+entirely.
+
+#### Canonical denial reasons
+
+`/delegate`:
+- `missing or malformed Authorization header`
+- `jwt validation failed: <underlying error>`
+- `malformed request body`
+- `requested_destinations must not be empty`
+- `policy resolution error: <underlying error>`
+- `no policy entry matched identity`
+- `requested destination not in granted set: <destination>`
+- `nonce mint failed: <underlying error>`
+
+`/token`:
+- `source address is not permitted`
+- `malformed request body`
+- `nonce and destination are required`
+- `nonce is not valid: <underlying error>`
+- `destination is not granted by this nonce`
+- `destination is not configured`
+- `destination mint failed: <underlying error>`
+
+The `<underlying error>` suffixes preserve the verifier's reason
+(`token is expired`, `signing method HS512 is invalid`, etc.) so
+operators can distinguish routine expiry from active forgery
+attempts without leaking the distinction to clients.
 
 ## License
 

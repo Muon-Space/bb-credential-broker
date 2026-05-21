@@ -41,6 +41,14 @@ type Record struct {
 	// longer valid. Implementations should treat ExpiresAt as
 	// authoritative regardless of any other expiry tracking.
 	ExpiresAt time.Time
+
+	// JTI is the unique identifier the backend assigned to the
+	// issued token. NonceStore.Mint populates this field before
+	// returning so the /delegate audit log entry can reference
+	// the specific token issued. The field is audit-only and
+	// carries no security significance; it is left empty by
+	// NonceStore.Claim.
+	JTI string
 }
 
 // AllowsDestination reports whether the named destination appears in

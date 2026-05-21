@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/audit"
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/auth"
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/destinations/httptokenexchange"
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/secrets"
@@ -586,5 +587,159 @@ func TestMint_GETRequestSendsNoBody(t *testing.T) {
 	}
 	if len(fake.requestBody) != 0 {
 		t.Errorf("body: got %q, want empty", fake.requestBody)
+	}
+}
+
+// TestMint_PopulatesMintAuditOnSuccess verifies that the audit
+// hook receives the resolved upstream URL, the upstream status
+// code, and a non-zero duration. The /token handler reads these
+// out of the context-installed MintAudit after Mint returns and
+// folds them into the TokenEntry it emits.
+func TestMint_PopulatesMintAuditOnSuccess(t *testing.T) {
+	t.Parallel()
+	fake := newFakeDestination(http.StatusOK, `{"token":"abc"}`)
+	defer fake.Close()
+
+	cfg := &httptokenexchange.Config{
+		Request:  httptokenexchange.RequestConfig{Method: "POST", URL: fake.URL() + "/token"},
+		Response: httptokenexchange.ResponseConfig{TokenJSONPath: "token"},
+	}
+	impl, err := httptokenexchange.New("test", cfg, newTestDeps())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	mintAudit := &audit.MintAudit{}
+	ctx := audit.ContextWithMintAudit(context.Background(), mintAudit)
+	if _, err := impl.Mint(ctx, newTestIdentity()); err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+
+	if mintAudit.UpstreamURL != fake.URL()+"/token" {
+		t.Errorf("UpstreamURL: got %q, want %q", mintAudit.UpstreamURL, fake.URL()+"/token")
+	}
+	if mintAudit.UpstreamStatusCode != http.StatusOK {
+		t.Errorf("UpstreamStatusCode: got %d, want %d", mintAudit.UpstreamStatusCode, http.StatusOK)
+	}
+	if mintAudit.UpstreamDuration <= 0 {
+		t.Errorf("UpstreamDuration: got %v, want > 0", mintAudit.UpstreamDuration)
+	}
+	if mintAudit.UpstreamResponseExcerpt != "" {
+		t.Errorf("UpstreamResponseExcerpt: got %q on success, want empty", mintAudit.UpstreamResponseExcerpt)
+	}
+}
+
+// TestMint_PopulatesMintAuditOnUpstreamRejection covers the
+// failure path: the audit hook captures the upstream status, a
+// non-zero duration, and an excerpt of the upstream response body
+// truncated to the documented prefix length.
+func TestMint_PopulatesMintAuditOnUpstreamRejection(t *testing.T) {
+	t.Parallel()
+	fake := newFakeDestination(http.StatusUnauthorized, `{"error":"the-upstream-said-no"}`)
+	defer fake.Close()
+
+	cfg := &httptokenexchange.Config{
+		Request:  httptokenexchange.RequestConfig{Method: "POST", URL: fake.URL() + "/token"},
+		Response: httptokenexchange.ResponseConfig{TokenJSONPath: "token"},
+	}
+	impl, err := httptokenexchange.New("test", cfg, newTestDeps())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	mintAudit := &audit.MintAudit{}
+	ctx := audit.ContextWithMintAudit(context.Background(), mintAudit)
+	if _, err := impl.Mint(ctx, newTestIdentity()); err == nil {
+		t.Fatal("expected Mint error from non-200 status, got nil")
+	}
+
+	if mintAudit.UpstreamStatusCode != http.StatusUnauthorized {
+		t.Errorf("UpstreamStatusCode: got %d, want %d", mintAudit.UpstreamStatusCode, http.StatusUnauthorized)
+	}
+	if !strings.Contains(mintAudit.UpstreamResponseExcerpt, "the-upstream-said-no") {
+		t.Errorf("UpstreamResponseExcerpt: got %q", mintAudit.UpstreamResponseExcerpt)
+	}
+}
+
+// TestMint_TruncatesExcerpt verifies the 256-byte cap on the
+// upstream-response excerpt: a longer body is sliced rather than
+// inflating the audit-log line.
+func TestMint_TruncatesExcerpt(t *testing.T) {
+	t.Parallel()
+	long := strings.Repeat("x", 1024)
+	fake := newFakeDestination(http.StatusBadRequest, long)
+	defer fake.Close()
+
+	cfg := &httptokenexchange.Config{
+		Request:  httptokenexchange.RequestConfig{Method: "POST", URL: fake.URL() + "/token"},
+		Response: httptokenexchange.ResponseConfig{TokenJSONPath: "token"},
+	}
+	impl, err := httptokenexchange.New("test", cfg, newTestDeps())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	mintAudit := &audit.MintAudit{}
+	ctx := audit.ContextWithMintAudit(context.Background(), mintAudit)
+	_, _ = impl.Mint(ctx, newTestIdentity())
+
+	if got := len(mintAudit.UpstreamResponseExcerpt); got > 256 {
+		t.Errorf("UpstreamResponseExcerpt length: got %d, want <= 256", got)
+	}
+}
+
+// TestMint_PopulatesMintAuditOnTransportError exercises the
+// transport-failure path: the URL was resolved and captured, but
+// the request never received a response (http.Client returned an
+// error). The status stays zero and the duration is still
+// recorded.
+func TestMint_PopulatesMintAuditOnTransportError(t *testing.T) {
+	t.Parallel()
+	// Construct a URL that points at an unreachable port so the
+	// http.Client surfaces a transport error rather than receiving
+	// a response.
+	cfg := &httptokenexchange.Config{
+		Request:  httptokenexchange.RequestConfig{Method: "POST", URL: "http://127.0.0.1:1/token"},
+		Response: httptokenexchange.ResponseConfig{TokenJSONPath: "token"},
+	}
+	impl, err := httptokenexchange.New("test", cfg, newTestDeps())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	mintAudit := &audit.MintAudit{}
+	ctx := audit.ContextWithMintAudit(context.Background(), mintAudit)
+	if _, err := impl.Mint(ctx, newTestIdentity()); err == nil {
+		t.Fatal("expected transport error, got nil")
+	}
+
+	if mintAudit.UpstreamURL == "" {
+		t.Errorf("UpstreamURL: got empty, want populated even on transport error")
+	}
+	if mintAudit.UpstreamStatusCode != 0 {
+		t.Errorf("UpstreamStatusCode: got %d, want 0 (no response received)", mintAudit.UpstreamStatusCode)
+	}
+}
+
+// TestMint_NoMintAuditInContextIsHarmless makes sure callers that
+// do not install a MintAudit are not penalised: the destination
+// implementation must skip the population calls rather than panic
+// on a nil pointer.
+func TestMint_NoMintAuditInContextIsHarmless(t *testing.T) {
+	t.Parallel()
+	fake := newFakeDestination(http.StatusOK, `{"token":"abc"}`)
+	defer fake.Close()
+
+	cfg := &httptokenexchange.Config{
+		Request:  httptokenexchange.RequestConfig{Method: "POST", URL: fake.URL() + "/"},
+		Response: httptokenexchange.ResponseConfig{TokenJSONPath: "token"},
+	}
+	impl, err := httptokenexchange.New("test", cfg, newTestDeps())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// No ContextWithMintAudit wrapper here.
+	if _, err := impl.Mint(context.Background(), newTestIdentity()); err != nil {
+		t.Fatalf("Mint without MintAudit context: %v", err)
 	}
 }

@@ -172,6 +172,10 @@ func (s *SignedStore) Mint(rec *Record) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("signed: sign token: %w", err)
 	}
+	// Expose the JTI on the supplied record so callers (the
+	// /delegate handler in particular) can name the issued token
+	// in their audit-log entry.
+	rec.JTI = jti
 	return signed, nil
 }
 

@@ -54,7 +54,7 @@ func run(args []string, stderr io.Writer) int {
 			return 2
 		}
 		if err := app.Validate(args[2]); err != nil {
-			fmt.Fprintln(stderr, err)
+			_, _ = fmt.Fprintln(stderr, err)
 			return 1
 		}
 		return 0
@@ -83,5 +83,5 @@ func run(args []string, stderr io.Writer) int {
 // validate path the first time they invoke the binary with no
 // arguments.
 func usage(w io.Writer, prog string) {
-	fmt.Fprintf(w, "usage:\n  %s <config.jsonnet>\n  %s validate <config.jsonnet>\n", prog, prog)
+	_, _ = fmt.Fprintf(w, "usage:\n  %s <config.jsonnet>\n  %s validate <config.jsonnet>\n", prog, prog)
 }

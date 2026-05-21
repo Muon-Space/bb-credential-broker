@@ -245,3 +245,200 @@ func TestToken_RejectsMalformedBody(t *testing.T) {
 		t.Errorf("status: got %d, want %d", w.Code, http.StatusBadRequest)
 	}
 }
+
+// TestToken_SuccessEntryCarriesUpstreamFields confirms that the
+// audit record for a successful /token mint folds in whatever
+// MintAudit the destination implementation populated. The test
+// uses a stubDestination that pre-populates the MintAudit value
+// in its Mint method via a callback that mirrors what
+// httptokenexchange.Mint does in production.
+func TestToken_SuccessEntryCarriesUpstreamFields(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t, time.Minute)
+	nonce := mintNonce(t, s, "alpha")
+
+	stub := &auditingStub{
+		token: &destinations.Token{Value: "abc", Scheme: "bearer", ExpiresAt: time.Unix(1700000900, 0).UTC()},
+		populate: func(a *audit.MintAudit) {
+			a.UpstreamURL = "https://upstream.example.com/token"
+			a.UpstreamStatusCode = 200
+			a.UpstreamDuration = 12 * time.Millisecond
+		},
+	}
+	rec := &recordingLogger{}
+	h := handlers.NewTokenHandler(
+		[]*net.IPNet{mustCIDR(t, "10.0.0.0/8")},
+		s,
+		destinations.Registry{"alpha": stub},
+		rec,
+		nil,
+	)
+	r := httptest.NewRequest(http.MethodPost, "/token",
+		strings.NewReader(`{"nonce":"`+nonce+`","destination":"alpha"}`))
+	r.RemoteAddr = "10.0.0.42:12345"
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want %d (body=%s)", w.Code, http.StatusOK, w.Body.String())
+	}
+	if len(rec.token) != 1 {
+		t.Fatalf("audit calls: got %d, want 1", len(rec.token))
+	}
+	entry := rec.token[0]
+	if entry.Result != audit.ResultSuccess {
+		t.Errorf("Result: got %q, want success", entry.Result)
+	}
+	if entry.UpstreamURL != "https://upstream.example.com/token" {
+		t.Errorf("UpstreamURL: got %q", entry.UpstreamURL)
+	}
+	if entry.UpstreamStatus != 200 {
+		t.Errorf("UpstreamStatus: got %d", entry.UpstreamStatus)
+	}
+	if entry.UpstreamDurationMS != 12 {
+		t.Errorf("UpstreamDurationMS: got %d", entry.UpstreamDurationMS)
+	}
+	if entry.TokenExpiresAt == nil {
+		t.Errorf("TokenExpiresAt: got nil, want populated")
+	}
+}
+
+// TestToken_FailureEntryPopulatesExcerpt covers the failure path:
+// an upstream rejection that populates UpstreamResponseExcerpt
+// must surface that excerpt in the audit log under the documented
+// schema key.
+func TestToken_FailureEntryPopulatesExcerpt(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t, time.Minute)
+	nonce := mintNonce(t, s, "alpha")
+
+	stub := &auditingStub{
+		err: errors.New("upstream said no"),
+		populate: func(a *audit.MintAudit) {
+			a.UpstreamURL = "https://upstream/token"
+			a.UpstreamStatusCode = http.StatusUnauthorized
+			a.UpstreamDuration = 4 * time.Millisecond
+			a.UpstreamResponseExcerpt = `{"error":"unauthorized"}`
+		},
+	}
+	rec := &recordingLogger{}
+	h := handlers.NewTokenHandler(
+		[]*net.IPNet{mustCIDR(t, "10.0.0.0/8")},
+		s,
+		destinations.Registry{"alpha": stub},
+		rec,
+		nil,
+	)
+	r := httptest.NewRequest(http.MethodPost, "/token",
+		strings.NewReader(`{"nonce":"`+nonce+`","destination":"alpha"}`))
+	r.RemoteAddr = "10.0.0.42:12345"
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status: got %d, want %d", w.Code, http.StatusBadGateway)
+	}
+	if len(rec.token) != 1 {
+		t.Fatalf("audit calls: got %d, want 1", len(rec.token))
+	}
+	entry := rec.token[0]
+	if entry.Result != audit.ResultFailure {
+		t.Errorf("Result: got %q, want failure", entry.Result)
+	}
+	if entry.UpstreamResponseExcerpt != `{"error":"unauthorized"}` {
+		t.Errorf("UpstreamResponseExcerpt: got %q", entry.UpstreamResponseExcerpt)
+	}
+	if !strings.Contains(entry.DenialReason, "upstream said no") {
+		t.Errorf("DenialReason: got %q", entry.DenialReason)
+	}
+}
+
+// TestToken_StaticSecretLikeDestinationOmitsUpstream covers the
+// staticSecret case: a destination that performs no upstream HTTP
+// call leaves MintAudit zero, and the resulting TokenEntry has
+// upstream_* fields at their zero values so the JSON output drops
+// them entirely.
+func TestToken_StaticSecretLikeDestinationOmitsUpstream(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t, time.Minute)
+	nonce := mintNonce(t, s, "static")
+
+	stub := &auditingStub{
+		token: &destinations.Token{Value: "pat-value", Scheme: "basic", Username: "x-access-token"},
+		// No populate callback: simulates a destination that
+		// mints locally without an upstream call.
+	}
+	rec := &recordingLogger{}
+	h := handlers.NewTokenHandler(
+		[]*net.IPNet{mustCIDR(t, "10.0.0.0/8")},
+		s,
+		destinations.Registry{"static": stub},
+		rec,
+		nil,
+	)
+	r := httptest.NewRequest(http.MethodPost, "/token",
+		strings.NewReader(`{"nonce":"`+nonce+`","destination":"static"}`))
+	r.RemoteAddr = "10.0.0.42:12345"
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status: got %d (body=%s)", w.Code, w.Body.String())
+	}
+	if len(rec.token) != 1 {
+		t.Fatalf("audit calls: got %d, want 1", len(rec.token))
+	}
+	entry := rec.token[0]
+	if entry.UpstreamURL != "" || entry.UpstreamStatus != 0 || entry.UpstreamDurationMS != 0 {
+		t.Errorf("upstream_* fields should be zero for local mints, got URL=%q status=%d duration=%d",
+			entry.UpstreamURL, entry.UpstreamStatus, entry.UpstreamDurationMS)
+	}
+}
+
+// TestToken_AuditPrecedesResponseWrite is the /token counterpart
+// of the /delegate ordering test.
+func TestToken_AuditPrecedesResponseWrite(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t, time.Minute)
+	nonce := mintNonce(t, s, "alpha")
+
+	var auditFired bool
+	rec := &recordingLogger{onLog: func() { auditFired = true }}
+	stub := &auditingStub{token: &destinations.Token{Value: "abc", Scheme: "bearer"}}
+	h := handlers.NewTokenHandler(
+		[]*net.IPNet{mustCIDR(t, "10.0.0.0/8")},
+		s,
+		destinations.Registry{"alpha": stub},
+		rec,
+		nil,
+	)
+	r := httptest.NewRequest(http.MethodPost, "/token",
+		strings.NewReader(`{"nonce":"`+nonce+`","destination":"alpha"}`))
+	r.RemoteAddr = "10.0.0.42:12345"
+	w := &orderingResponseWriter{inner: httptest.NewRecorder(), auditFired: &auditFired, t: t}
+	h.ServeHTTP(w, r)
+
+	if !auditFired {
+		t.Errorf("audit hook never fired")
+	}
+}
+
+// auditingStub is a stubDestination variant that also runs a
+// populate callback against the MintAudit installed in the
+// context, mimicking what httptokenexchange.Mint does in
+// production. It lets handler-level tests assert audit-log
+// content without standing up a real upstream HTTPS server.
+type auditingStub struct {
+	token    *destinations.Token
+	err      error
+	populate func(*audit.MintAudit)
+}
+
+func (s *auditingStub) Mint(ctx context.Context, _ *auth.Identity) (*destinations.Token, error) {
+	if s.populate != nil {
+		if a := audit.MintAuditFromContext(ctx); a != nil {
+			s.populate(a)
+		}
+	}
+	return s.token, s.err
+}

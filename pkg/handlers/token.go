@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"net"
@@ -10,6 +9,7 @@ import (
 	"time"
 
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/audit"
+	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/auth"
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/destinations"
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/metrics"
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/store"
@@ -27,7 +27,7 @@ type TokenHandler struct {
 	allowedNets []*net.IPNet
 	store       store.NonceStore
 	registry    destinations.Registry
-	audit       *audit.Logger
+	audit       audit.Logger
 	metrics     *metrics.Metrics
 	now         func() time.Time
 }
@@ -37,7 +37,7 @@ type TokenHandler struct {
 // accepted; any request from a source outside the union of these
 // CIDRs is rejected with HTTP 401 before the body is read. metrics
 // may be nil when the caller does not need instrumentation.
-func NewTokenHandler(nets []*net.IPNet, s store.NonceStore, r destinations.Registry, a *audit.Logger, m *metrics.Metrics) *TokenHandler {
+func NewTokenHandler(nets []*net.IPNet, s store.NonceStore, r destinations.Registry, a audit.Logger, m *metrics.Metrics) *TokenHandler {
 	return &TokenHandler{
 		allowedNets: nets,
 		store:       s,
@@ -47,6 +47,20 @@ func NewTokenHandler(nets []*net.IPNet, s store.NonceStore, r destinations.Regis
 		now:         time.Now,
 	}
 }
+
+// Denial reasons emitted under the audit-log's denial_reason field
+// on the /token side. They are part of the published log schema.
+//
+//nolint:gosec // G101: these are denial-reason strings written to the audit log, not credentials
+const (
+	denialSourceNotPermitted    = "source address is not permitted"
+	denialTokenMalformedBody    = "malformed request body"
+	denialNonceOrDestEmpty      = "nonce and destination are required"
+	denialNonceInvalid          = "nonce is not valid"
+	denialDestinationNotInNonce = "destination is not granted by this nonce"
+	denialDestinationNotKnown   = "destination is not configured"
+	denialDestinationMintFailed = "destination mint failed"
+)
 
 // tokenRequest is the JSON body the caller POSTs to /token.
 type tokenRequest struct {
@@ -81,13 +95,19 @@ func (h *TokenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // name. identityType is empty when the request was rejected before
 // nonce claim; destination is empty when the request was rejected
 // before the body was parsed.
+//
+// Every code path emits exactly one audit-log entry before writing
+// the HTTP response. The handler installs a MintAudit value in the
+// context handed to the destination's Mint call so the destination
+// can populate upstream metadata that the audit-log entry surfaces
+// uniformly across success and failure paths.
 func (h *TokenHandler) serve(w http.ResponseWriter, r *http.Request) (int, string, string) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return http.StatusMethodNotAllowed, "", ""
 	}
 	if !h.sourceAllowed(r) {
-		h.recordFailure("", "", http.StatusUnauthorized)
+		h.recordTokenFailure(r, nil, "", "", denialSourceNotPermitted, nil)
 		http.Error(w, "source address is not permitted", http.StatusUnauthorized)
 		return http.StatusUnauthorized, "", ""
 	}
@@ -96,12 +116,12 @@ func (h *TokenHandler) serve(w http.ResponseWriter, r *http.Request) (int, strin
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
-		h.recordFailure("", "", http.StatusBadRequest)
+		h.recordTokenFailure(r, nil, "", "", denialTokenMalformedBody, nil)
 		http.Error(w, "malformed request body", http.StatusBadRequest)
 		return http.StatusBadRequest, "", ""
 	}
 	if req.Nonce == "" || req.Destination == "" {
-		h.recordFailure("", req.Destination, http.StatusBadRequest)
+		h.recordTokenFailure(r, nil, "", req.Destination, denialNonceOrDestEmpty, nil)
 		http.Error(w, "nonce and destination are required", http.StatusBadRequest)
 		return http.StatusBadRequest, "", req.Destination
 	}
@@ -109,50 +129,48 @@ func (h *TokenHandler) serve(w http.ResponseWriter, r *http.Request) (int, strin
 	rec, err := h.store.Claim(req.Nonce)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			// Audit log carries the underlying reason (expired,
-			// bad signature, wrong issuer, etc.) so that
-			// operators can distinguish routine token expiry
-			// from active forgery attempts. The HTTP response
-			// stays opaque so callers cannot probe.
-			h.recordClaimFailure(req.Destination, http.StatusGone, err)
+			// Audit log retains the underlying reason
+			// (expired, bad signature, wrong issuer, etc.)
+			// so operators can distinguish routine token
+			// expiry from active forgery attempts. The
+			// HTTP response stays opaque so callers cannot
+			// probe.
+			h.recordTokenFailure(r, nil, "", req.Destination, denialNonceInvalid+": "+err.Error(), nil)
 			http.Error(w, "nonce is not valid", http.StatusGone)
 			return http.StatusGone, "", req.Destination
 		}
-		h.recordFailure("", req.Destination, http.StatusInternalServerError)
+		h.recordTokenFailure(r, nil, "", req.Destination, "claim error: "+err.Error(), nil)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return http.StatusInternalServerError, "", req.Destination
 	}
 	identityType := string(rec.Identity.Type)
 	if !rec.AllowsDestination(req.Destination) {
-		h.recordFailure(identityType, rec.Identity.Principal, http.StatusForbidden)
+		h.recordTokenFailure(r, rec.Identity, identityType, req.Destination, denialDestinationNotInNonce, nil)
 		http.Error(w, "destination is not granted by this nonce", http.StatusForbidden)
 		return http.StatusForbidden, identityType, req.Destination
 	}
 
 	dest := h.registry.Lookup(req.Destination)
 	if dest == nil {
-		h.recordFailure(identityType, rec.Identity.Principal, http.StatusNotFound)
+		h.recordTokenFailure(r, rec.Identity, identityType, req.Destination, denialDestinationNotKnown, nil)
 		http.Error(w, "destination is not configured", http.StatusNotFound)
 		return http.StatusNotFound, identityType, req.Destination
 	}
 
-	tok, err := dest.Mint(r.Context(), rec.Identity)
+	// Install the MintAudit so the destination implementation
+	// can populate upstream-call metadata that this handler
+	// folds into the TokenEntry regardless of mint outcome.
+	mintAudit := &audit.MintAudit{}
+	ctx := audit.ContextWithMintAudit(r.Context(), mintAudit)
+
+	tok, err := dest.Mint(ctx, rec.Identity)
 	if err != nil {
-		h.recordMintFailure(rec, req.Destination, http.StatusBadGateway, err)
+		h.recordTokenFailure(r, rec.Identity, identityType, req.Destination, denialDestinationMintFailed+": "+err.Error(), mintAudit)
 		http.Error(w, "destination mint failed", http.StatusBadGateway)
 		return http.StatusBadGateway, identityType, req.Destination
 	}
 
-	if h.audit != nil {
-		h.audit.Log(r.Context(), audit.Event{
-			Time:              h.now(),
-			Op:                audit.OperationToken,
-			IdentityType:      identityType,
-			IdentityPrincipal: rec.Identity.Principal,
-			Destination:       req.Destination,
-			Success:           true,
-		})
-	}
+	h.recordTokenSuccess(r, rec.Identity, req.Destination, tok, mintAudit)
 	writeJSON(w, http.StatusOK, tokenResponse{
 		Token:     tok.Value,
 		ExpiresAt: tok.ExpiresAt,
@@ -185,48 +203,63 @@ func (h *TokenHandler) sourceAllowed(r *http.Request) bool {
 	return false
 }
 
-func (h *TokenHandler) recordFailure(identityType, destination string, status int) {
+// recordTokenFailure emits one TokenEntry with result="failure"
+// and the supplied denial reason. The mintAudit argument may be
+// nil for failures that occur before destination dispatch (source
+// gate, malformed body, etc.); when non-nil its populated fields
+// are propagated into the entry.
+//
+//nolint:revive // argument count mirrors the shape of the entry
+func (h *TokenHandler) recordTokenFailure(r *http.Request, identity *auth.Identity, identityType, destination, reason string, mintAudit *audit.MintAudit) {
 	if h.audit == nil {
 		return
 	}
-	h.audit.Log(context.Background(), audit.Event{
+	_ = identityType // recorded via the metrics layer at ServeHTTP; preserved in the signature for symmetry with recordTokenSuccess.
+	entry := audit.TokenEntry{
 		Time:         h.now(),
-		Op:           audit.OperationToken,
-		IdentityType: identityType,
+		Identity:     toIdentityRecord(identity),
 		Destination:  destination,
-		Success:      false,
-		Error:        http.StatusText(status),
-	})
+		Result:       audit.ResultFailure,
+		DenialReason: reason,
+	}
+	applyMintAudit(&entry, mintAudit)
+	h.audit.LogToken(r.Context(), entry)
 }
 
-func (h *TokenHandler) recordClaimFailure(destination string, status int, err error) {
+// recordTokenSuccess emits one TokenEntry with result="success"
+// and the minted token's expiry, along with whatever upstream
+// metadata the destination populated.
+func (h *TokenHandler) recordTokenSuccess(r *http.Request, identity *auth.Identity, destination string, tok *destinations.Token, mintAudit *audit.MintAudit) {
 	if h.audit == nil {
 		return
 	}
-	msg := http.StatusText(status)
-	if err != nil {
-		msg = msg + ": " + err.Error()
-	}
-	h.audit.Log(context.Background(), audit.Event{
+	entry := audit.TokenEntry{
 		Time:        h.now(),
-		Op:          audit.OperationToken,
+		Identity:    toIdentityRecord(identity),
 		Destination: destination,
-		Success:     false,
-		Error:       msg,
-	})
+		Result:      audit.ResultSuccess,
+	}
+	if !tok.ExpiresAt.IsZero() {
+		exp := tok.ExpiresAt
+		entry.TokenExpiresAt = &exp
+	}
+	applyMintAudit(&entry, mintAudit)
+	h.audit.LogToken(r.Context(), entry)
 }
 
-func (h *TokenHandler) recordMintFailure(rec *store.Record, destination string, status int, err error) {
-	if h.audit == nil {
+// applyMintAudit folds the upstream-call metadata produced by the
+// destination's Mint call into entry. The function tolerates a nil
+// mintAudit: failures before destination dispatch leave entry's
+// upstream_* fields zero, and the omitempty tags drop them from
+// the JSON output.
+func applyMintAudit(entry *audit.TokenEntry, mintAudit *audit.MintAudit) {
+	if mintAudit == nil {
 		return
 	}
-	h.audit.Log(context.Background(), audit.Event{
-		Time:              h.now(),
-		Op:                audit.OperationToken,
-		IdentityType:      string(rec.Identity.Type),
-		IdentityPrincipal: rec.Identity.Principal,
-		Destination:       destination,
-		Success:           false,
-		Error:             http.StatusText(status) + ": " + err.Error(),
-	})
+	entry.UpstreamURL = mintAudit.UpstreamURL
+	entry.UpstreamStatus = mintAudit.UpstreamStatusCode
+	if mintAudit.UpstreamDuration > 0 {
+		entry.UpstreamDurationMS = mintAudit.UpstreamDuration.Milliseconds()
+	}
+	entry.UpstreamResponseExcerpt = mintAudit.UpstreamResponseExcerpt
 }
