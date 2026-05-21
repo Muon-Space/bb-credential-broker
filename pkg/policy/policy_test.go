@@ -449,6 +449,179 @@ func TestResolvePath_AllForms(t *testing.T) {
 	}
 }
 
+// TestEngine_ContainsOperator exercises the array-membership
+// operator end to end. The operator targets array-of-string claims
+// such as Okta's native "groups" claim; the test cases cover the
+// happy path together with the type-mismatch and missing-claim
+// edges that fail closed rather than erroring.
+func TestEngine_ContainsOperator(t *testing.T) {
+	t.Parallel()
+	eng := mustEngine(t, policy.Config{
+		Users: []policy.Entry{
+			{
+				Match:               map[string]policy.Match{"claims.groups": {Contains: strp("bazel-broker-itar")}},
+				AllowedDestinations: []string{"alpha"},
+			},
+		},
+	})
+
+	cases := []struct {
+		name   string
+		claims map[string]any
+		want   []string
+	}{
+		{
+			name:   "array contains operand",
+			claims: map[string]any{"groups": []any{"bazel-broker-eu", "bazel-broker-itar"}},
+			want:   []string{"alpha"},
+		},
+		{
+			name:   "array does not contain operand",
+			claims: map[string]any{"groups": []any{"bazel-broker-eu"}},
+			want:   nil,
+		},
+		{
+			name:   "claim is a string, not an array",
+			claims: map[string]any{"groups": "bazel-broker-itar"},
+			want:   nil,
+		},
+		{
+			name:   "array of non-strings",
+			claims: map[string]any{"groups": []any{1, 2, 3}},
+			want:   nil,
+		},
+		{
+			name:   "claim absent",
+			claims: nil,
+			want:   nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, _ := eng.Resolve(userIdentity("u@example.com", tc.claims))
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("Resolve: got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestEngine_ContainsCombinedWithStringOperator confirms that
+// contains and a sibling string-valued matcher inside the same
+// Entry are AND-combined like any other pair of matchers. This is
+// the practical configuration shape for ITAR routing: gate on the
+// groups claim *and* on a repository claim simultaneously.
+func TestEngine_ContainsCombinedWithStringOperator(t *testing.T) {
+	t.Parallel()
+	eng := mustEngine(t, policy.Config{
+		Users: []policy.Entry{
+			{
+				Match: map[string]policy.Match{
+					"claims.groups":     {Contains: strp("bazel-broker-itar")},
+					"claims.repository": {Equals: strp("owner/repo")},
+				},
+				AllowedDestinations: []string{"alpha"},
+			},
+		},
+	})
+
+	both := userIdentity("u@e.com", map[string]any{
+		"groups":     []any{"bazel-broker-itar"},
+		"repository": "owner/repo",
+	})
+	if got, _ := eng.Resolve(both); !slices.Equal(got, []string{"alpha"}) {
+		t.Errorf("both pass: got %v, want [alpha]", got)
+	}
+
+	groupOnly := userIdentity("u@e.com", map[string]any{
+		"groups":     []any{"bazel-broker-itar"},
+		"repository": "other/repo",
+	})
+	if got, _ := eng.Resolve(groupOnly); len(got) != 0 {
+		t.Errorf("only group matches: got %v, want empty", got)
+	}
+
+	repoOnly := userIdentity("u@e.com", map[string]any{
+		"groups":     []any{"bazel-broker-eu"},
+		"repository": "owner/repo",
+	})
+	if got, _ := eng.Resolve(repoOnly); len(got) != 0 {
+		t.Errorf("only repository matches: got %v, want empty", got)
+	}
+}
+
+func TestNew_RejectsContainsWithEquals(t *testing.T) {
+	t.Parallel()
+	cfg := policy.Config{
+		Users: []policy.Entry{
+			{
+				Match: map[string]policy.Match{
+					"claims.groups": {Contains: strp("a"), Equals: strp("b")},
+				},
+				AllowedDestinations: []string{"alpha"},
+			},
+		},
+	}
+	_, err := policy.New(cfg)
+	if err == nil {
+		t.Fatal("expected error for contains+equals, got nil")
+	}
+	if !strings.Contains(err.Error(), "multiple operators") {
+		t.Errorf("error %q lacks expected wording", err.Error())
+	}
+	if !strings.Contains(err.Error(), "contains") {
+		t.Errorf("error %q should name the contains operator", err.Error())
+	}
+}
+
+func TestResolveArrayPath_AllForms(t *testing.T) {
+	t.Parallel()
+	id := &auth.Identity{
+		Type:      auth.IdentityTypeUser,
+		Principal: "u@example.com",
+		Claims: map[string]any{
+			"groups":      []any{"a", "b", "c"},
+			"empty":       []any{},
+			"mixed":       []any{"a", 1, "b"},
+			"string":      "not-an-array",
+			"nested":      map[string]any{"inner": []any{"x"}},
+			"non_strings": []any{1, 2, 3},
+		},
+	}
+	cases := []struct {
+		path string
+		want []string
+		ok   bool
+	}{
+		{path: "claims.groups", want: []string{"a", "b", "c"}, ok: true},
+		{path: "claims.empty", want: []string{}, ok: true},
+		{path: "claims.nested.inner", want: []string{"x"}, ok: true},
+		{path: "claims.mixed", ok: false},
+		{path: "claims.string", ok: false},
+		{path: "claims.non_strings", ok: false},
+		{path: "claims.absent", ok: false},
+		{path: "principal", ok: false},
+		{path: "type", ok: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			t.Parallel()
+			got, ok := policy.ResolveArrayPath(id, tc.path)
+			if ok != tc.ok {
+				t.Fatalf("ok: got %v, want %v", ok, tc.ok)
+			}
+			if ok && !slices.Equal(got, tc.want) {
+				t.Errorf("value: got %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	if _, ok := policy.ResolveArrayPath(nil, "claims.groups"); ok {
+		t.Error("nil identity: ok=true, want false")
+	}
+}
+
 // mustEngine constructs an Engine from cfg, failing the test on
 // configuration errors.
 func mustEngine(t *testing.T, cfg policy.Config) policy.Engine {
