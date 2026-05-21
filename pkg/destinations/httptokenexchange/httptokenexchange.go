@@ -233,7 +233,56 @@ func New(name string, cfg *Config, deps Dependencies) (*Impl, error) {
 		}
 	}
 
+	if err := out.validateTemplates(); err != nil {
+		return nil, err
+	}
+
 	return out, nil
+}
+
+// validateTemplates runs configuration-time checks over every
+// template parsed during New. The checks catch operator mistakes
+// that would otherwise surface only at the first /token request:
+// references to template functions with the wrong arity, and
+// ${secret:NAME} expressions whose NAME is not registered in the
+// broker's secrets map.
+//
+// Each check is expressed as a callback handed to Template.Walk so
+// the AST is traversed once even when several checks apply to the
+// same call expression.
+func (i *Impl) validateTemplates() error {
+	validators := template.DefaultValidators()
+	for _, t := range i.allTemplates() {
+		if t == nil {
+			continue
+		}
+		if err := t.Validate(validators); err != nil {
+			return err
+		}
+		if err := t.Walk(i.checkSecretRef); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkSecretRef verifies that every ${secret:NAME} expression whose
+// NAME is a static literal refers to a secret that was registered in
+// the broker's top-level secrets map. References whose NAME is itself
+// a template (for example ${secret:${env:NAME}}) cannot be resolved
+// statically and are left for evaluation time.
+func (i *Impl) checkSecretRef(name string, args []*template.Template) error {
+	if name != "secret" || len(args) != 1 {
+		return nil
+	}
+	literal, ok := args[0].AsLiteral()
+	if !ok {
+		return nil
+	}
+	if _, ok := i.deps.NamedSecrets[literal]; !ok {
+		return fmt.Errorf("${secret:%s}: no secret named %q is registered", literal, literal)
+	}
+	return nil
 }
 
 func (i *Impl) parseBody(body *BodyConfig) error {

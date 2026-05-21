@@ -11,7 +11,7 @@ import (
 
 // Scope is the per-evaluation context passed to every chunk during
 // Template.Eval. It carries the resolved Identity, the secret
-// loader, the clock, and the registry of built-in functions.
+// loader, the clock, and the registries of built-in functions.
 //
 // A Scope is constructed once per /token request: the Identity is
 // the snapshot stored against the nonce, Secrets is the loader
@@ -39,17 +39,35 @@ type Scope struct {
 	// DefaultFuncs to obtain the standard set; tests may add or
 	// override entries to inject mock behaviour.
 	Funcs map[string]Func
+
+	// LazyFuncs is the registry of built-in functions that need
+	// access to their unevaluated argument templates — typically
+	// because they implement error-tolerant evaluation rules
+	// (${default:EXPR:fallback}). The dispatcher checks
+	// LazyFuncs before Funcs so a name registered in both maps
+	// resolves to the lazy form; in practice the two registries
+	// have disjoint keys.
+	LazyFuncs map[string]LazyFunc
 }
 
-// Func is the signature implemented by every built-in function.
-// Implementations should fail loudly on argument-shape errors and
-// return early for transient runtime errors so the surrounding
-// /token handler can surface a meaningful HTTP status.
+// Func is the signature implemented by every built-in function that
+// evaluates its arguments eagerly. Implementations should fail
+// loudly on argument-shape errors and return early for transient
+// runtime errors so the surrounding /token handler can surface a
+// meaningful HTTP status.
 type Func func(ctx context.Context, scope *Scope, args []string) (string, error)
 
+// LazyFunc is the signature implemented by built-in functions that
+// take responsibility for evaluating their own arguments. The
+// dispatcher passes the parsed argument templates directly; the
+// function decides when (or whether) to call Template.Eval on each.
+// This is the mechanism that lets ${default:EXPR:fallback} swallow
+// a failure from EXPR and substitute the fallback expression.
+type LazyFunc func(ctx context.Context, scope *Scope, args []*Template) (string, error)
+
 // DefaultScope constructs a Scope wired with the default function
-// registry. Callers typically do not need to override the function
-// map; tests do so to inject deterministic behaviour for ${file:},
+// registries. Callers typically do not need to override the function
+// maps; tests do so to inject deterministic behaviour for ${file:},
 // ${secret:} and ${signjwt:}.
 func DefaultScope(identity *auth.Identity, ldr secrets.Loader, named map[string]secrets.SecretRef) *Scope {
 	return &Scope{
@@ -58,6 +76,7 @@ func DefaultScope(identity *auth.Identity, ldr secrets.Loader, named map[string]
 		NamedSecrets: named,
 		Now:          time.Now,
 		Funcs:        DefaultFuncs(),
+		LazyFuncs:    DefaultLazyFuncs(),
 	}
 }
 

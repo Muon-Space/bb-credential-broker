@@ -71,16 +71,20 @@ type Entry struct {
 //
 // Operators:
 //
-//	equals   exact string match
-//	glob     path.Match-style glob match (segments separated by '/'')
-//	in       membership in a set of strings
+//	equals    exact string match against a string-valued claim
+//	glob      path.Match-style glob match against a string-valued claim
+//	in        membership in a set of strings (string-valued claim)
+//	contains  membership of a single string within an array-valued claim
 //
-// Adding a new operator is done by appending a field here and a
-// corresponding case to the compileMatch dispatcher.
+// The contains operator is the only one that targets array-valued
+// claims; the others apply to string-valued claims. Adding a new
+// operator is done by appending a field here and a corresponding
+// case to the compileMatch dispatcher.
 type Match struct {
-	Equals *string  `json:"equals,omitempty"`
-	Glob   *string  `json:"glob,omitempty"`
-	In     []string `json:"in,omitempty"`
+	Equals   *string  `json:"equals,omitempty"`
+	Glob     *string  `json:"glob,omitempty"`
+	In       []string `json:"in,omitempty"`
+	Contains *string  `json:"contains,omitempty"`
 }
 
 // Engine resolves an Identity to a slice of allowed destination
@@ -205,11 +209,32 @@ func compileEntry(e Entry) (compiledEntry, error) {
 
 // compileMatch builds the single check that evaluates m against the
 // value resolved from fieldPath on the candidate Identity.
+//
+// The compiled check picks between a string-valued resolver
+// (ResolvePath, used by equals/glob/in) and an array-valued
+// resolver (ResolveArrayPath, used by contains) according to which
+// operator the operator configured. Both resolvers return false on
+// missing claims and on type mismatches, so a contains rule
+// against a string-valued claim — or an equals rule against an
+// array-valued claim — simply does not match rather than erroring.
 func compileMatch(fieldPath string, m Match) (check, error) {
 	if err := validateFieldPath(fieldPath); err != nil {
 		return nil, err
 	}
-	op, err := selectOperator(m)
+	if err := requireSingleOperator(m); err != nil {
+		return nil, err
+	}
+	if m.Contains != nil {
+		want := *m.Contains
+		return func(id *auth.Identity) bool {
+			arr, ok := ResolveArrayPath(id, fieldPath)
+			if !ok {
+				return false
+			}
+			return slices.Contains(arr, want)
+		}, nil
+	}
+	op, err := selectStringOperator(m)
 	if err != nil {
 		return nil, err
 	}
@@ -220,6 +245,35 @@ func compileMatch(fieldPath string, m Match) (check, error) {
 		}
 		return op(v)
 	}, nil
+}
+
+// requireSingleOperator enforces the mutual-exclusion contract on
+// the Match struct: exactly one of equals, glob, in, contains may
+// be set per Match value. The check runs at configuration-load time
+// and surfaces operator typos before any request exercises the
+// policy entry.
+func requireSingleOperator(m Match) error {
+	set := 0
+	if m.Equals != nil {
+		set++
+	}
+	if m.Glob != nil {
+		set++
+	}
+	if m.In != nil {
+		set++
+	}
+	if m.Contains != nil {
+		set++
+	}
+	switch set {
+	case 0:
+		return fmt.Errorf("no operator set; expected one of: equals, glob, in, contains")
+	case 1:
+		return nil
+	default:
+		return fmt.Errorf("multiple operators set; expected exactly one of: equals, glob, in, contains")
+	}
 }
 
 // validateFieldPath surfaces typos in match keys at start-up.
@@ -258,26 +312,12 @@ func validateFieldPath(p string) error {
 // the operand baked into the Match value at compile time.
 type stringPredicate func(value string) bool
 
-// selectOperator validates that exactly one operator field is set on
-// m and returns the corresponding stringPredicate.
-func selectOperator(m Match) (stringPredicate, error) {
-	set := 0
-	if m.Equals != nil {
-		set++
-	}
-	if m.Glob != nil {
-		set++
-	}
-	if m.In != nil {
-		set++
-	}
-	switch set {
-	case 0:
-		return nil, fmt.Errorf("no operator set; expected one of: equals, glob, in")
-	case 1:
-	default:
-		return nil, fmt.Errorf("multiple operators set; expected exactly one of: equals, glob, in")
-	}
+// selectStringOperator returns the stringPredicate corresponding to
+// whichever string-valued operator (equals, glob, in) is set on m.
+// The mutual-exclusion check has already run in requireSingleOperator
+// before this function is called; selectStringOperator merely
+// dispatches on the single populated field.
+func selectStringOperator(m Match) (stringPredicate, error) {
 	switch {
 	case m.Equals != nil:
 		want := *m.Equals
@@ -295,10 +335,66 @@ func selectOperator(m Match) (stringPredicate, error) {
 			matched, err := path.Match(pattern, v)
 			return err == nil && matched
 		}, nil
-	default:
+	case m.In != nil:
 		want := slices.Clone(m.In)
 		return func(v string) bool { return slices.Contains(want, v) }, nil
+	default:
+		// Unreachable because requireSingleOperator runs first;
+		// kept as a defensive guard so that a future operator
+		// addition that forgets to update compileMatch's dispatch
+		// surfaces as a startup error rather than a silent match
+		// failure.
+		return nil, fmt.Errorf("internal: no string operator set on Match")
 	}
+}
+
+// ResolveArrayPath returns the slice value at the given dotted path
+// on id, or (nil, false) if the path does not select an array of
+// strings.
+//
+// Only the "claims.X.Y..." root resolves to an array-valued field;
+// "principal" and "type" are always string-valued and yield
+// (nil, false) here. The resolver requires every element of the
+// resolved array to be a string: a mixed or non-string array
+// produces (nil, false) rather than dropping the offending elements,
+// so a contains rule against a claim that exists but is the wrong
+// shape fails closed.
+//
+// ResolveArrayPath is exported alongside ResolvePath so that future
+// matchers and audit-log enrichment can reuse the same resolution
+// rules without re-implementing the type discipline.
+func ResolveArrayPath(id *auth.Identity, p string) ([]string, bool) {
+	if id == nil {
+		return nil, false
+	}
+	parts := strings.Split(p, ".")
+	if parts[0] != "claims" || len(parts) < 2 {
+		return nil, false
+	}
+	var cur any = map[string]any(id.Claims)
+	for _, key := range parts[1:] {
+		m, ok := cur.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		cur, ok = m[key]
+		if !ok {
+			return nil, false
+		}
+	}
+	arr, ok := cur.([]any)
+	if !ok {
+		return nil, false
+	}
+	out := make([]string, 0, len(arr))
+	for _, v := range arr {
+		s, ok := v.(string)
+		if !ok {
+			return nil, false
+		}
+		out = append(out, s)
+	}
+	return out, true
 }
 
 // ResolvePath returns the string value at the given dotted path on

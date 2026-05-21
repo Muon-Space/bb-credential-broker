@@ -13,6 +13,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 
+	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/auth"
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/destinations/httptokenexchange/template"
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/secrets"
 )
@@ -192,5 +193,101 @@ func TestSignJWT_UnsupportedAlg(t *testing.T) {
 	_, err := tmpl.Eval(context.Background(), scope)
 	if err == nil {
 		t.Fatal("expected error from unsupported algorithm, got nil")
+	}
+}
+
+// TestDefault_PrimaryExpressionWins exercises the success path: the
+// first argument evaluates without error and its value is returned;
+// the fallback is not consulted.
+func TestDefault_PrimaryExpressionWins(t *testing.T) {
+	t.Parallel()
+	id := &auth.Identity{
+		Type:      auth.IdentityTypeCI,
+		Principal: "the-principal",
+		Claims:    map[string]any{"present": "yes"},
+	}
+	tmpl := template.MustParse("${default:${identity.claims.present}:fallback}")
+	got, err := tmpl.Eval(context.Background(), newScope(t, id))
+	if err != nil {
+		t.Fatalf("Eval: %v", err)
+	}
+	if got != "yes" {
+		t.Errorf("got %q, want %q", got, "yes")
+	}
+}
+
+// TestDefault_FallbackOnMissingClaim verifies the headline use
+// case: a destination template that references a claim a newly
+// created repository has not yet been classified against returns
+// the operator-supplied fallback rather than erroring at /token
+// time.
+func TestDefault_FallbackOnMissingClaim(t *testing.T) {
+	t.Parallel()
+	id := &auth.Identity{
+		Type:      auth.IdentityTypeCI,
+		Principal: "the-principal",
+		Claims:    map[string]any{},
+	}
+	tmpl := template.MustParse("${default:${identity.claims.absent}:fallback}")
+	got, err := tmpl.Eval(context.Background(), newScope(t, id))
+	if err != nil {
+		t.Fatalf("Eval: %v", err)
+	}
+	if got != "fallback" {
+		t.Errorf("got %q, want %q", got, "fallback")
+	}
+}
+
+// TestDefault_NestedFallbackIsTemplated confirms that the fallback
+// argument is itself a template: a missing claim falls through to
+// an expression that itself substitutes a different identity field.
+func TestDefault_NestedFallbackIsTemplated(t *testing.T) {
+	t.Parallel()
+	id := &auth.Identity{
+		Type:      auth.IdentityTypeCI,
+		Principal: "the-principal",
+		Claims:    map[string]any{},
+	}
+	tmpl := template.MustParse("${default:${identity.claims.absent}:${identity.principal}}")
+	got, err := tmpl.Eval(context.Background(), newScope(t, id))
+	if err != nil {
+		t.Fatalf("Eval: %v", err)
+	}
+	if got != "the-principal" {
+		t.Errorf("got %q, want %q", got, "the-principal")
+	}
+}
+
+// TestDefault_EmptyFallbackIsValid demonstrates that the empty
+// string is a legal fallback value — useful when downstream callers
+// distinguish absent from empty themselves.
+func TestDefault_EmptyFallbackIsValid(t *testing.T) {
+	t.Parallel()
+	id := &auth.Identity{Type: auth.IdentityTypeCI, Principal: "p", Claims: map[string]any{}}
+	tmpl := template.MustParse("${default:${identity.claims.absent}:}")
+	got, err := tmpl.Eval(context.Background(), newScope(t, id))
+	if err != nil {
+		t.Fatalf("Eval: %v", err)
+	}
+	if got != "" {
+		t.Errorf("got %q, want empty", got)
+	}
+}
+
+// TestDefault_FallbackCoversNonVariableErrors verifies the
+// error-tolerance is not specific to missing-variable failures: a
+// failed ${secret:...} lookup (a different error class) also
+// triggers the fallback.
+func TestDefault_FallbackCoversNonVariableErrors(t *testing.T) {
+	t.Parallel()
+	scope := template.DefaultScope(nil, secrets.NewMapLoader(), map[string]secrets.SecretRef{})
+	scope.Now = fixedTime
+	tmpl := template.MustParse("${default:${secret:does-not-exist}:fallback}")
+	got, err := tmpl.Eval(context.Background(), scope)
+	if err != nil {
+		t.Fatalf("Eval: %v", err)
+	}
+	if got != "fallback" {
+		t.Errorf("got %q, want %q", got, "fallback")
 	}
 }

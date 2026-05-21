@@ -132,6 +132,12 @@ func TestSignedStore_MintClaim(t *testing.T) {
 	if tok == "" {
 		t.Fatal("Mint returned empty token")
 	}
+	// Mint must populate the JTI on the supplied record so the
+	// /delegate handler can reference the issued token in its
+	// audit-log entry.
+	if rec.JTI == "" {
+		t.Errorf("Mint did not populate rec.JTI")
+	}
 
 	got, err := s.Claim(tok)
 	if err != nil {
@@ -153,6 +159,30 @@ func TestSignedStore_MintClaim(t *testing.T) {
 		if got.AllowedDestinations[i] != d {
 			t.Errorf("AllowedDestinations[%d]: got %q, want %q", i, got.AllowedDestinations[i], d)
 		}
+	}
+}
+
+// TestSignedStore_MintAssignsUniqueJTI confirms that consecutive
+// Mint calls produce distinct JTIs. The audit-log consumer joins
+// /delegate and /token rows on this value, so collisions would
+// break ITAR evidence pivots.
+func TestSignedStore_MintAssignsUniqueJTI(t *testing.T) {
+	t.Parallel()
+	s := newSignedStore(t)
+	seen := map[string]bool{}
+	const runs = 64
+	for i := 0; i < runs; i++ {
+		rec := newRecord(t)
+		if _, err := s.Mint(rec); err != nil {
+			t.Fatalf("Mint #%d: %v", i, err)
+		}
+		if rec.JTI == "" {
+			t.Fatalf("Mint #%d: empty JTI", i)
+		}
+		if seen[rec.JTI] {
+			t.Fatalf("Mint #%d: duplicate JTI %q", i, rec.JTI)
+		}
+		seen[rec.JTI] = true
 	}
 }
 

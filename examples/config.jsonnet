@@ -215,6 +215,15 @@
         match:               { 'claims.tier': { equals: 'internal' } },
         allowedDestinations: ['artifactory-prod', 'vault-jwt'],
       },
+      {
+        // Demonstrates matching against an array-valued claim.
+        // OIDC providers such as Okta emit group membership as a
+        // JSON array under the 'groups' claim natively; the
+        // contains operator inspects the array and matches when
+        // the named value is present.
+        match:               { 'claims.groups': { contains: 'bazel-broker-itar' } },
+        allowedDestinations: ['artifactory-prod'],
+      },
     ],
   },
 }

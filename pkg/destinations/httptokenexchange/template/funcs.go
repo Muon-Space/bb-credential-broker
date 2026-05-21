@@ -33,6 +33,83 @@ func DefaultFuncs() map[string]Func {
 	}
 }
 
+// Validator reports whether a call to one of the built-in template
+// functions is structurally valid. Validators are intended for
+// configuration-load-time checks that the template engine itself
+// cannot express, such as arity requirements that differ between
+// otherwise similarly-shaped functions.
+//
+// Validators receive the unevaluated argument templates so they may
+// examine static literals when relevant; they must not invoke
+// Template.Eval, which would have side effects unrelated to
+// validation.
+type Validator func(args []*Template) error
+
+// DefaultValidators returns a fresh registry containing the
+// configuration-load-time validators for the built-in template
+// functions. The returned map is owned by the caller. Callers wire
+// the result into Template.Validate during their own configuration
+// load step.
+//
+// Functions whose argument requirements are entirely enforced at
+// evaluation time are absent from the registry.
+func DefaultValidators() map[string]Validator {
+	return map[string]Validator{
+		"default": validateDefaultArgs,
+	}
+}
+
+// DefaultLazyFuncs returns a fresh registry containing the
+// built-in lazy template functions — those that take responsibility
+// for evaluating their own arguments. The returned map is owned by
+// the caller; tests may add or override entries before passing the
+// map to a Scope.
+//
+// Today the registry holds only ${default:EXPR:fallback}; the
+// pattern exists so that future error-tolerant constructs can
+// register here without a second mechanism.
+func DefaultLazyFuncs() map[string]LazyFunc {
+	return map[string]LazyFunc{
+		"default": defaultFunc,
+	}
+}
+
+// defaultFunc evaluates the primary expression and returns its
+// value on success, falling back to the second argument when the
+// primary expression returns any error (a missing variable
+// reference, a missing secret, a failed file read, etc.).
+//
+// The function is registered as a LazyFunc so the dispatcher does
+// not pre-evaluate the primary expression — that would prevent the
+// fallback path from ever firing. The fallback is itself a template
+// and may contain its own ${...} expressions, including further
+// ${default:...} calls. Validation of the two-argument shape runs
+// at configuration-load time in validateDefaultArgs.
+func defaultFunc(ctx context.Context, scope *Scope, args []*Template) (string, error) {
+	if len(args) != 2 {
+		// validateDefaultArgs should have rejected this at
+		// configuration load. The eval-time guard exists so a
+		// caller wiring a Scope without running validation
+		// still sees a useful error rather than a panic.
+		return "", fmt.Errorf("expected 2 arguments, got %d", len(args))
+	}
+	if v, err := args[0].Eval(ctx, scope); err == nil {
+		return v, nil
+	}
+	return args[1].Eval(ctx, scope)
+}
+
+// validateDefaultArgs enforces the two-argument shape of
+// ${default:EXPR:fallback} at configuration-load time so an
+// operator typo surfaces at broker startup rather than at the
+// first /token request that exercises the template.
+func validateDefaultArgs(args []*Template) error {
+	if len(args) != 2 {
+		return fmt.Errorf("expected 2 arguments, got %d", len(args))
+	}
+	return nil
+}
+
 // fileFunc reads a file from disk at evaluation time. It is the
 // primary mechanism for projecting the broker's own ServiceAccount
 // JWT into outbound token-exchange requests.

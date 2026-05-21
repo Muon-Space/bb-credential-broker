@@ -38,6 +38,22 @@ jobs:
         with:
           version: v2.12
           args: --timeout=5m
+      # Sanity-check that the shipped example configuration would
+      # pass `bb-credential-broker validate` against the file tree
+      # an operator's deployment actually creates. Stage dummy
+      # fixtures at the paths the example references; the validate
+      # path reads and parses them but does not need them to be real
+      # signing keys.
+      - name: Validate example config
+        run: |
+          set -eux
+          sudo mkdir -p /etc/jwks /etc/broker/destinations /var/run/secrets/eks.amazonaws.com/serviceaccount
+          echo '{"keys":[{"kid":"k1","kty":"RSA","n":"AQAB","e":"AQAB"}]}' | sudo tee /etc/jwks/github-jwks.json >/dev/null
+          echo '{"keys":[{"kid":"k1","kty":"RSA","n":"AQAB","e":"AQAB"}]}' | sudo tee /etc/jwks/okta-jwks.json >/dev/null
+          sudo dd if=/dev/urandom of=/etc/broker/signing-key bs=32 count=1
+          echo "x" | sudo tee /etc/broker/destinations/ghe-packages-pat >/dev/null
+          sudo touch /var/run/secrets/eks.amazonaws.com/serviceaccount/token
+          go run ./cmd/bb-credential-broker validate examples/config.jsonnet
 
   build:
     name: build ${{ matrix.target.platform }}
