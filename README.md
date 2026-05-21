@@ -186,6 +186,29 @@ make docker-build  # multi-stage build, distroless/static runtime
 make docker-run    # run the development image with examples/config.jsonnet
 ```
 
+## Operating
+
+The broker has a single executable with two subcommand forms:
+
+```sh
+bb-credential-broker <config.jsonnet>            # run the broker
+bb-credential-broker validate <config.jsonnet>   # check configuration
+```
+
+The `validate` subcommand loads the configuration and runs every
+check the broker performs at start-up — Jsonnet evaluation, JWKS
+file parsing, signing-key length, CIDR syntax, secret-ref name
+resolution, policy entry compilation, destination template parsing
+— and exits 0 when the configuration is valid or non-zero with an
+aggregated error list when it is not. The subcommand does not bind
+network listeners, open outbound HTTP connections, read AWS Secrets
+Manager, or start background goroutines.
+
+Run it in CI as a gate on changes to the deployment's configuration
+inputs, or as a `terragrunt plan` precondition so misconfiguration
+is caught at PR review time rather than when the broker pod fails
+to start in cluster.
+
 ## Releases
 
 Each push to `main` produces a fresh release. The release tag follows

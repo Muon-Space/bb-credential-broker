@@ -33,6 +33,30 @@ func DefaultFuncs() map[string]Func {
 	}
 }
 
+// Validator reports whether a call to one of the built-in template
+// functions is structurally valid. Validators are intended for
+// configuration-load-time checks that the template engine itself
+// cannot express, such as arity requirements that differ between
+// otherwise similarly-shaped functions.
+//
+// Validators receive the unevaluated argument templates so they may
+// examine static literals when relevant; they must not invoke
+// Template.Eval, which would have side effects unrelated to
+// validation.
+type Validator func(args []*Template) error
+
+// DefaultValidators returns a fresh registry containing the
+// configuration-load-time validators for the built-in template
+// functions. The returned map is owned by the caller. Callers wire
+// the result into Template.Validate during their own configuration
+// load step.
+//
+// Functions whose argument requirements are entirely enforced at
+// evaluation time are absent from the registry.
+func DefaultValidators() map[string]Validator {
+	return map[string]Validator{}
+}
+
 // fileFunc reads a file from disk at evaluation time. It is the
 // primary mechanism for projecting the broker's own ServiceAccount
 // JWT into outbound token-exchange requests.

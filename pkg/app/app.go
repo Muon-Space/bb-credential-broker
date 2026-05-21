@@ -59,7 +59,17 @@ type App struct {
 // configuration is loaded via the default chain; the caller must
 // arrange for AWS credentials (typically IRSA) to be available in
 // the broker's environment before calling Run.
+//
+// New runs the same configuration-load-time checks as the standalone
+// `bb-credential-broker validate` subcommand before constructing
+// any AWS-backed dependencies, so configuration problems surface
+// with identical error text whether discovered ahead of time or at
+// broker boot.
 func New(ctx context.Context, cfg *config.Config) (*App, error) {
+	if err := ValidateConfig(cfg); err != nil {
+		return nil, err
+	}
+
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("aws config: %w", err)

@@ -152,6 +152,87 @@ func (t *Template) Eval(ctx context.Context, scope *Scope) (string, error) {
 	return sb.String(), nil
 }
 
+// Validate walks t and applies each per-function validator from
+// validators to every matching call expression. Validators are
+// intended to run once at configuration-load time so that operator
+// mistakes — wrong arg counts, statically-resolvable arguments that
+// reference undeclared names — surface at broker startup rather
+// than at the first /token request that exercises the template.
+//
+// Validators is a map from function name to the validator function
+// to apply; functions absent from the map are ignored.
+func (t *Template) Validate(validators map[string]Validator) error {
+	return t.Walk(func(name string, args []*Template) error {
+		v, ok := validators[name]
+		if !ok {
+			return nil
+		}
+		if err := v(args); err != nil {
+			return fmt.Errorf("template: %s: %w", name, err)
+		}
+		return nil
+	})
+}
+
+// AsLiteral returns the template's text and true when t consists
+// solely of literal chunks (no ${...} expressions). Callers use this
+// to perform configuration-time validation of arguments to template
+// functions that the broker can resolve statically, such as the
+// secret name in ${secret:NAME}; expressions whose argument is itself
+// templated are left for evaluation time.
+func (t *Template) AsLiteral() (string, bool) {
+	var sb strings.Builder
+	for _, c := range t.chunks {
+		lit, ok := c.(literal)
+		if !ok {
+			return "", false
+		}
+		sb.WriteString(string(lit))
+	}
+	return sb.String(), true
+}
+
+// Walk visits every function-call expression in t, including
+// arguments of nested calls, and invokes fn with the call's function
+// name and unevaluated argument templates. The walk stops at the
+// first error returned by fn and propagates it to the caller.
+//
+// Walk runs purely over the parsed AST and triggers no evaluation;
+// it is intended for configuration-time validation passes that need
+// to check call shape (arg counts, statically resolvable argument
+// values) before any request exercises the template.
+func (t *Template) Walk(fn func(name string, args []*Template) error) error {
+	for _, c := range t.chunks {
+		if err := walkChunk(c, fn); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// walkChunk implements the recursive descent used by Template.Walk.
+// Non-call chunks (literals and variable references) contribute
+// nothing to the walk; call expressions invoke fn and then descend
+// into each argument's own chunks so that nested calls are visited
+// in source order.
+func walkChunk(c chunk, fn func(name string, args []*Template) error) error {
+	ce, ok := c.(*callExpr)
+	if !ok {
+		return nil
+	}
+	if err := fn(ce.name, ce.args); err != nil {
+		return err
+	}
+	for _, a := range ce.args {
+		for _, sub := range a.chunks {
+			if err := walkChunk(sub, fn); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // parser is the recursive-descent parser for template strings.
 type parser struct {
 	input string
