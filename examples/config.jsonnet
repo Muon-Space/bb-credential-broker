@@ -75,9 +75,52 @@
         field: 'private_key',
       },
     },
+    // PEM-encoded RSA private key the broker uses to sign its
+    // own subject_token JWTs (see the artifactory-prod
+    // destination below). The public half is derived at startup
+    // and published at /.well-known/jwks.json on the API
+    // listener.
+    'broker-signing-key': {
+      awsSecretsManager: {
+        arn:   'arn:aws:secretsmanager:us-east-1:000000000000:secret:bb-credential-broker/signing-key',
+        field: 'private_key',
+      },
+    },
+  },
+
+  // Enable the broker's own JWT signing path. When this block is
+  // present the broker exposes /.well-known/jwks.json on the API
+  // listener carrying the public half of the named key.
+  // Destinations whose downstream evaluates identity-mapping
+  // claims only inside the JWT carried as subject_token (notably
+  // any OAuth 2.0 token-exchange endpoint that silently drops
+  // request-body extensions) reference the same named secret in
+  // a ${signjwt:RS256:${secret:broker-signing-key}:...}
+  // expression. The kid the broker stamps into each JWT header
+  // matches the kid published in the JWKS, so downstream
+  // verifiers resolve the right key without operator
+  // coordination.
+  brokerSigner: {
+    privateKeySecret: 'broker-signing-key',
   },
 
   destinations: {
+    // OAuth 2.0 token-exchange destination whose downstream
+    // (Artifactory's /access/api/v1/oidc/token, but the same
+    // shape applies to any RFC 8693 endpoint that evaluates
+    // identity-mapping claims only against subject_token) gets a
+    // broker-signed JWT as subject_token. The broker mints the
+    // JWT inline via ${signjwt:RS256:...}, embedding the
+    // forwarded identity claims plus standard iss/iat/exp; the
+    // downstream verifier fetches the broker's published JWKS to
+    // validate the signature.
+    //
+    // Body-level "additional_claims" or similar request
+    // extensions are NOT used: services in this category silently
+    // drop unknown request-body fields and evaluate mappings
+    // against subject_token claims only, so any identity
+    // attribute that must reach a mapping rule has to be inside
+    // the signed token.
     'artifactory-prod': {
       httpTokenExchange: {
         request: {
@@ -88,10 +131,41 @@
           },
           body: { form: {
             grant_type:         'urn:ietf:params:oauth:grant-type:token-exchange',
+            // RFC 8693 §3 defines both
+            // 'urn:ietf:params:oauth:token-type:id_token' and
+            // 'urn:ietf:params:oauth:token-type:jwt'; some
+            // downstreams (JFrog among them) historically accept
+            // only the former even though the broker-signed JWT
+            // is technically the latter. The example defaults to
+            // :id_token because it is the broadly-accepted shape;
+            // operators whose downstream documents :jwt set that
+            // value instead.
             subject_token_type: 'urn:ietf:params:oauth:token-type:id_token',
-            subject_token:      '${file:/var/run/secrets/eks.amazonaws.com/serviceaccount/token}',
-            provider_name:      'eks-bazel-cache',
-            additional_claims:  '{"originating_subject":${jsonString:${identity.principal}}}',
+            // The signjwt template's third argument is a JSON
+            // object literal. Number values (iat, exp) and the
+            // hardcoded string fields are written verbatim; any
+            // value that derives from runtime data is wrapped in
+            // ${jsonString:...} so it lands in the JSON properly
+            // escaped and quoted.
+            //
+            // Operators tune 'sub' and 'aud' to match what the
+            // downstream identity-mapping engine evaluates. The
+            // example below sets 'sub' to the originating CI
+            // principal so downstream mappings can pivot on it;
+            // operators whose existing mappings already gate on a
+            // fixed broker service-account sub can instead hard
+            // code that value here and keep their mappings
+            // unchanged.
+            subject_token:
+              '${signjwt:RS256:${secret:broker-signing-key}:{' +
+              '"iss":"https://bb-credential-broker.example.com",' +
+              '"sub":${jsonString:${identity.principal}},' +
+              '"iat":${now},' +
+              '"exp":${now+300s},' +
+              '"aud":"artifactory-token-exchange",' +
+              '"team":${jsonString:${default:${identity.claims.team}:unknown}}' +
+              '}}',
+            provider_name: 'bb-credential-broker',
           } },
         },
         response: {

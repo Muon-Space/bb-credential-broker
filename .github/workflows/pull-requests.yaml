@@ -49,6 +49,11 @@ jobs:
           sudo touch /etc/broker/destinations/ghe-packages-pat
           echo "x" | sudo tee /etc/broker/destinations/ghe-packages-pat >/dev/null
           sudo touch /var/run/secrets/eks.amazonaws.com/serviceaccount/token
+          # The broker's RSA signing key is referenced in the
+          # example config but the validate path does not reach
+          # AWS Secrets Manager (it substitutes a no-op loader);
+          # only the secret name resolution is checked, so no
+          # additional file fixture is required.
           go run ./cmd/bb-credential-broker validate examples/config.jsonnet
 
   build:

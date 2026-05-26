@@ -45,6 +45,13 @@ func Validate(path string) error {
 // resolved against the broker's configured secrets map (a name-only
 // check), not against the underlying backend, so validation does
 // not require AWS credentials or network reachability.
+//
+// Asymmetry worth flagging: the brokerSigner key's PEM is also
+// only name-checked here against the secrets map. The PEM bytes
+// themselves cannot be parsed without reaching the secret backend,
+// so a malformed or wrong-type signing key surfaces only at the
+// app.New code path. config.Validate covers the name reference;
+// that is the most validate can do without AWS credentials.
 func ValidateConfig(cfg *config.Config) error {
 	if cfg == nil {
 		return fmt.Errorf("config is nil")

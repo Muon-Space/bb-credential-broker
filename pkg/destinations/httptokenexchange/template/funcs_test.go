@@ -16,6 +16,7 @@ import (
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/auth"
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/destinations/httptokenexchange/template"
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/secrets"
+	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/signer"
 )
 
 func TestFile_ReadsFromDisk(t *testing.T) {
@@ -183,6 +184,57 @@ func TestSignJWT_RoundTrip(t *testing.T) {
 	}
 	if claims["iss"] != "app" {
 		t.Errorf("iss: got %v, want %q", claims["iss"], "app")
+	}
+	// The signed JWT must carry a kid header so downstream
+	// verifiers that look up signing keys in a JWKS by kid (the
+	// broker's own JWKS endpoint, JFrog's generic-OIDC provider,
+	// any other PKIX consumer) resolve the right entry without
+	// operator coordination.
+	if _, ok := parsed.Header["kid"].(string); !ok {
+		t.Errorf("kid header missing or non-string: %+v", parsed.Header)
+	}
+}
+
+// TestSignJWT_KIDIsRFC7638Thumbprint asserts the kid the signer
+// embeds matches the RFC 7638 JWK thumbprint of the public key.
+// The check pairs with pkg/signer's thumbprint vector test: a
+// future refactor that changes one half of the kid-derivation
+// chain without changing the other surfaces here.
+func TestSignJWT_KIDIsRFC7638Thumbprint(t *testing.T) {
+	t.Parallel()
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(priv),
+	})
+
+	loader := secrets.NewMapLoader()
+	ref := secrets.SecretRef{
+		AWSSecretsManager: &secrets.AWSSecretsManagerRef{ARN: "arn:test:k"},
+	}
+	loader.Set("aws:arn:test:k#", pemBytes)
+
+	scope := template.DefaultScope(nil, loader, map[string]secrets.SecretRef{"k": ref})
+	scope.Now = fixedTime
+	tmpl := template.MustParse(`${signjwt:RS256:${secret:k}:{"iss":"app","iat":${now}}}`)
+	signed, err := tmpl.Eval(context.Background(), scope)
+	if err != nil {
+		t.Fatalf("Eval: %v", err)
+	}
+	parsed, err := jwt.Parse(signed, func(*jwt.Token) (any, error) { return &priv.PublicKey, nil })
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	gotKID, _ := parsed.Header["kid"].(string)
+	wantKID, err := signer.Thumbprint(&priv.PublicKey)
+	if err != nil {
+		t.Fatalf("Thumbprint: %v", err)
+	}
+	if gotKID != wantKID {
+		t.Errorf("kid: got %q, want %q (RFC 7638 thumbprint)", gotKID, wantKID)
 	}
 }
 

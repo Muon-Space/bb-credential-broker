@@ -163,7 +163,10 @@ func TestLoad_ExampleConfigParses(t *testing.T) {
 	if len(cfg.Destinations) != 4 {
 		t.Errorf("Destinations: got %d, want 4", len(cfg.Destinations))
 	}
-	if len(cfg.Secrets) != 1 {
-		t.Errorf("Secrets: got %d, want 1", len(cfg.Secrets))
+	if len(cfg.Secrets) != 2 {
+		t.Errorf("Secrets: got %d, want 2", len(cfg.Secrets))
+	}
+	if cfg.BrokerSigner == nil {
+		t.Errorf("BrokerSigner: got nil, want populated")
 	}
 }

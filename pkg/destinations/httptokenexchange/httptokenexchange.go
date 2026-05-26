@@ -243,9 +243,10 @@ func New(name string, cfg *Config, deps Dependencies) (*Impl, error) {
 // validateTemplates runs configuration-time checks over every
 // template parsed during New. The checks catch operator mistakes
 // that would otherwise surface only at the first /token request:
-// references to template functions with the wrong arity, and
-// ${secret:NAME} expressions whose NAME is not registered in the
-// broker's secrets map.
+// references to template functions that do not exist, references
+// to built-in functions with the wrong arity, and ${secret:NAME}
+// expressions whose NAME is not registered in the broker's
+// secrets map.
 //
 // Each check is expressed as a callback handed to Template.Walk so
 // the AST is traversed once even when several checks apply to the
@@ -256,12 +257,28 @@ func (i *Impl) validateTemplates() error {
 		if t == nil {
 			continue
 		}
+		if err := t.Walk(checkBuiltinFunction); err != nil {
+			return err
+		}
 		if err := t.Validate(validators); err != nil {
 			return err
 		}
 		if err := t.Walk(i.checkSecretRef); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// checkBuiltinFunction errors when a template references a
+// function the broker has no implementation for. Without the
+// check a typo like ${json:...} (when the operator meant
+// ${jsonString:...}) reaches /token before surfacing; the walk
+// pulls the failure forward to broker startup and to the
+// `bb-credential-broker validate` subcommand.
+func checkBuiltinFunction(name string, _ []*template.Template) error {
+	if !template.IsBuiltinFunction(name) {
+		return fmt.Errorf("${%s:...}: unknown template function", name)
 	}
 	return nil
 }
