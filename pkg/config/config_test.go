@@ -3,6 +3,7 @@ package config_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/config"
@@ -128,6 +129,35 @@ func TestLoad_RejectsUnknownTopLevelField(t *testing.T) {
 	}
 }
 
+// TestLoad_RejectsTypoInSecretRef pins the invariant for
+// SecretRef.UnmarshalJSON: typos inside a SecretRef's backend
+// block must not be silently ignored. The custom UnmarshalJSON
+// installs its own strict decoder because json.Unmarshal does not
+// propagate the outer Decoder's DisallowUnknownFields setting.
+func TestLoad_RejectsTypoInSecretRef(t *testing.T) {
+	t.Parallel()
+	body := `{
+  apiServer:         { listenAddress: ':8080' },
+  diagnosticsServer: { listenAddress: ':9980' },
+  tokenAllowedCIDRs: ['10.0.0.0/8'],
+  jwtAuth: { issuers: [{ url: 'x', jwksFile: '/etc/jwks/x.json', identityType: 'ci' }] },
+  nonceStore: { signed: { signingKeyFile: '/etc/broker/key', ttl: '5m' } },
+  secrets: {
+    'k': {
+      // 'feild' is a typo of 'field' — must be rejected.
+      awsSecretsManager: { arn: 'arn:x', feild: 'private_key' },
+    },
+  },
+}`
+	_, err := config.Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("expected typo in awsSecretsManager.feild to be rejected, got nil")
+	}
+	if !strings.Contains(err.Error(), "feild") && !strings.Contains(err.Error(), "unknown field") {
+		t.Errorf("error %q should name the unknown field", err.Error())
+	}
+}
+
 func TestLoad_RejectsBadIdentityType(t *testing.T) {
 	t.Parallel()
 	body := `{
@@ -140,6 +170,73 @@ func TestLoad_RejectsBadIdentityType(t *testing.T) {
 	_, err := config.Load(writeConfig(t, body))
 	if err == nil {
 		t.Fatal("expected identityType validation error, got nil")
+	}
+}
+
+// TestLoad_RejectsBrokerSignerBothShapes pins the mutual-
+// exclusion contract between privateKeySecret (single) and
+// privateKeySecrets (list). An operator who supplies both has
+// almost certainly made a copy-paste mistake during a rotation;
+// surfacing it at configuration load avoids ambiguity about
+// which key is active.
+func TestLoad_RejectsBrokerSignerBothShapes(t *testing.T) {
+	t.Parallel()
+	body := `{
+  apiServer:         { listenAddress: ':8080' },
+  diagnosticsServer: { listenAddress: ':9980' },
+  tokenAllowedCIDRs: ['10.0.0.0/8'],
+  jwtAuth: { issuers: [{ url: 'x', jwksFile: '/etc/jwks/x.json', identityType: 'ci' }] },
+  nonceStore: { signed: { signingKeyFile: '/etc/broker/key', ttl: '5m' } },
+  secrets: {
+    k1: { awsSecretsManager: { arn: 'arn:x', field: 'p' } },
+    k2: { awsSecretsManager: { arn: 'arn:y', field: 'p' } },
+  },
+  brokerSigner: {
+    privateKeySecret:  'k1',
+    privateKeySecrets: ['k1', 'k2'],
+  },
+}`
+	_, err := config.Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("expected mutual-exclusion error, got nil")
+	}
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Errorf("error %q should mention mutual exclusion", err.Error())
+	}
+}
+
+// TestLoad_AcceptsBrokerSignerSecretsList confirms the new
+// privateKeySecrets list shape parses and validates cleanly with
+// multiple key references.
+func TestLoad_AcceptsBrokerSignerSecretsList(t *testing.T) {
+	t.Parallel()
+	body := `{
+  apiServer:         { listenAddress: ':8080' },
+  diagnosticsServer: { listenAddress: ':9980' },
+  tokenAllowedCIDRs: ['10.0.0.0/8'],
+  jwtAuth: { issuers: [{ url: 'x', jwksFile: '/etc/jwks/x.json', identityType: 'ci' }] },
+  nonceStore: { signed: { signingKeyFile: '/etc/broker/key', ttl: '5m' } },
+  secrets: {
+    'broker-key-v1': { awsSecretsManager: { arn: 'arn:v1', field: 'p' } },
+    'broker-key-v2': { awsSecretsManager: { arn: 'arn:v2', field: 'p' } },
+  },
+  brokerSigner: {
+    privateKeySecrets: ['broker-key-v1', 'broker-key-v2'],
+  },
+}`
+	cfg, err := config.Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got := cfg.BrokerSigner.EffectiveSigningSecrets()
+	want := []string{"broker-key-v1", "broker-key-v2"}
+	if len(got) != len(want) {
+		t.Fatalf("EffectiveSigningSecrets length: got %d, want %d", len(got), len(want))
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Errorf("EffectiveSigningSecrets[%d]: got %q, want %q", i, got[i], want[i])
+		}
 	}
 }
 

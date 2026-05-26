@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/jmespath/go-jmespath"
@@ -84,6 +85,20 @@ type BodyConfig struct {
 	// are first templated as a string and the result must parse
 	// as valid JSON; the body is sent with Content-Type
 	// application/json.
+	//
+	// body.json carries one constraint operators must know
+	// about: a leaf string that contains BOTH a template
+	// expression and a literal double-quote character is
+	// rejected at configuration load. The combination is the
+	// footgun pattern that confuses the template parser's
+	// string-literal tracking once the bytes are JSON-encoded;
+	// the error points operators at body.form or body.raw with
+	// an explicit Content-Type instead. See README "Body
+	// encoding gotcha".
+	//
+	// Leaf strings with templates but no literal quotes (the
+	// common case of forwarding a secret or identity field by
+	// itself) are accepted.
 	JSON json.RawMessage `json:"json,omitempty"`
 
 	// Raw, when set, is the body as an opaque string. Callers
@@ -318,6 +333,20 @@ func (i *Impl) parseBody(body *BodyConfig) error {
 			i.parsedForm = append(i.parsedForm, parsedHeader{key: kt, value: vt})
 		}
 	case body.JSON != nil:
+		// body.json is serialised JSON bytes that the template
+		// parser then walks. Any leaf string value containing a
+		// template expression (${...}) will have its surrounding
+		// quote characters JSON-escaped to \" — but the template
+		// parser's parseArg uses an unescaped " toggle to track
+		// string-literal nesting, so the first \" flips the
+		// nesting flag on and every subsequent \" keeps it on,
+		// producing an unterminated-argument error far from the
+		// actual offending byte. Detecting the shape here, at
+		// configuration load, surfaces an actionable error
+		// before any /token request exercises the destination.
+		if err := checkBodyJSONForTemplates(body.JSON); err != nil {
+			return err
+		}
 		t, err := template.Parse(string(body.JSON))
 		if err != nil {
 			return fmt.Errorf("request.body.json: %w", err)
@@ -331,6 +360,93 @@ func (i *Impl) parseBody(body *BodyConfig) error {
 		i.parsedRaw = t
 	}
 	return nil
+}
+
+// checkBodyJSONForTemplates returns an actionable error when any
+// leaf string in the operator-supplied body.json contains the
+// footgun pattern: BOTH a template expression (${...}) AND a
+// literal double-quote character. The combination is what trips
+// the underlying bug — once the leaf string is JSON-encoded, the
+// embedded " becomes \", and the template parser's parseArg
+// string-literal tracking gets stuck in "inside string" mode and
+// eventually returns an unterminated-argument error far from the
+// offending byte.
+//
+// The check is deliberately narrow:
+//
+//   - "${secret:my-bearer-token}" passes (no literal "; safe).
+//   - "${identity.principal}" passes (no literal "; safe).
+//   - "static \"quoted\" value" passes (no template; just a string).
+//   - "${signjwt:RS256:k:{"iss":"x"}}" is rejected — the template
+//     argument carries inline JSON whose " characters will
+//     JSON-escape into the footgun pattern.
+//
+// Operators landing on the error switch to request.body.form
+// (each value templated in isolation) or request.body.raw
+// (a single opaque templated payload they own the Content-Type
+// for).
+//
+// The check decodes the operator-supplied JSON into an any tree
+// once at startup and walks it recursively. Non-string leaves are
+// ignored. The cost is paid once per destination at boot.
+func checkBodyJSONForTemplates(body []byte) error {
+	var decoded any
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		// A non-JSON body.json fails the subsequent
+		// template.Parse anyway; don't double-report here.
+		return nil
+	}
+	if path := findFootgunString(decoded, ""); path != "" {
+		return fmt.Errorf(
+			"request.body.json: leaf string at %s contains both a template expression and "+
+				"a literal '\"' character; the combination is incompatible with the template "+
+				"parser because the JSON-escaped \\\" sequences confuse string-literal tracking. "+
+				"Use request.body.form (each value templated in isolation) or request.body.raw "+
+				"(one opaque templated payload) instead",
+			path)
+	}
+	return nil
+}
+
+// findFootgunString returns the dotted-path location of the first
+// leaf string value within v that contains BOTH a template
+// expression AND a literal double-quote, or "" if none. Object
+// keys and array indices form the path so operator-facing errors
+// localise the offending value.
+//
+// The double-check requirement (both ${ and ") narrows the
+// detection to the exact pattern that triggers the parser bug
+// rather than rejecting every templated leaf indiscriminately;
+// benign uses like ${secret:my-token} as a JSON value continue
+// to work because the substituted bytes carry no literal quotes.
+func findFootgunString(v any, path string) string {
+	switch x := v.(type) {
+	case map[string]any:
+		for k, sub := range x {
+			leaf := path + "." + k
+			if path == "" {
+				leaf = k
+			}
+			if hit := findFootgunString(sub, leaf); hit != "" {
+				return hit
+			}
+		}
+	case []any:
+		for i, sub := range x {
+			leaf := fmt.Sprintf("%s[%d]", path, i)
+			if hit := findFootgunString(sub, leaf); hit != "" {
+				return hit
+			}
+		}
+	case string:
+		if strings.Contains(x, "${") && strings.Contains(x, `"`) {
+			if path == "" {
+				return "(root string)"
+			}
+			return path
+		}
+	}
+	return ""
 }
 
 // validateConfig performs the structural checks that don't require

@@ -92,6 +92,7 @@ expressions; the innermost expression is evaluated first.
 | `${b64:STR}` | Base64 encode the argument. | `${b64:user:pass}` |
 | `${env:VAR}` | Read an environment variable. Substituted at start-up rather than per request. | `${env:AWS_REGION}` |
 | `${default:EXPR:FALLBACK}` | Evaluate `EXPR`; return `FALLBACK` if `EXPR` fails for any reason (missing variable, missing secret, file read error, etc.). Both arguments are templates and may contain nested `${...}` expressions. | `${default:${identity.claims.classification}:unclassified}` |
+| `${json:KEY:VALUE:KEY:VALUE:...}` | Construct a JSON object. Each VALUE is a template; the result is auto-typed (numbers/booleans/null/pre-quoted strings/objects/arrays pass through verbatim, bare strings are JSON-escaped and quoted). Key order follows the operator-supplied argument order, not lexicographic sort. Used internally by the canonical broker-signed-JWT pattern to avoid hand-written braces, commas and quotes. | `${json:iat:${now}:sub:${identity.principal}}` |
 
 ### Static-secret destinations
 
@@ -183,6 +184,11 @@ aws secretsmanager create-secret \
   },
   brokerSigner: {
     privateKeySecret: 'broker-signing-key',
+    // Optional. When set, the broker also registers
+    // /.well-known/openid-configuration so spec-compliant
+    // downstreams (any GenericOidc consumer) auto-discover the
+    // JWKS endpoint instead of being configured per-field.
+    issuer: 'https://broker.example.com',
   },
 }
 ```
@@ -190,7 +196,10 @@ aws secretsmanager create-secret \
 When `brokerSigner` is present the broker registers a
 `GET /.well-known/jwks.json` handler on the API listener (the
 same listener `/delegate` and `/token` sit behind) returning a
-single-key JWKS:
+single-key JWKS. If `brokerSigner.issuer` is also set the broker
+registers `GET /.well-known/openid-configuration` returning a
+minimal OAuth 2.0 / OIDC discovery document so downstreams can
+auto-discover the JWKS URI. The JWKS body shape:
 
 ```json
 {
@@ -231,13 +240,13 @@ operator coordination:
         grant_type:         'urn:ietf:params:oauth:grant-type:token-exchange',
         subject_token_type: 'urn:ietf:params:oauth:token-type:id_token',
         subject_token:
-          '${signjwt:RS256:${secret:broker-signing-key}:{' +
-          '"iss":"https://broker.example.com",' +
-          '"sub":${jsonString:${identity.principal}},' +
-          '"iat":${now},' +
-          '"exp":${now+300s},' +
-          '"aud":"destination-token-exchange",' +
-          '"team":${jsonString:${default:${identity.claims.team}:unknown}}' +
+          '${signjwt:RS256:${secret:broker-signing-key}:${json:' +
+          'iss:"https://broker.example.com":' +
+          'sub:${identity.principal}:' +
+          'iat:${now}:' +
+          'exp:${now+300s}:' +
+          'aud:"destination-token-exchange":' +
+          'team:${default:${identity.claims.team}:unknown}' +
           '}}',
         provider_name: 'bb-credential-broker',
       } },
@@ -247,12 +256,13 @@ operator coordination:
 }
 ```
 
-The third argument to `signjwt` is a JSON object literal. Number
-values (`iat`, `exp`) and hardcoded strings are written verbatim;
-any value that derives from runtime data is wrapped in
-`${jsonString:...}` so it lands in the JSON properly escaped and
-quoted. There is no `${json:...}` template function — operators
-who need richer construction factor it into Jsonnet locals.
+`${json:...}` is the recommended way to construct the signjwt
+claims body: it auto-types each value (numbers stay unquoted,
+runtime strings get JSON-escaped and quoted, pre-quoted literals
+pass through verbatim) and key order follows the operator-supplied
+argument order. Operators who prefer to write the JSON literally
+can still pass a JSON object as `signjwt`'s third argument
+directly and wrap runtime strings in `${jsonString:...}`.
 
 #### Tuning the JWT for a specific downstream
 
@@ -281,6 +291,48 @@ for each depends on what the downstream OIDC provider validates:
 `examples/config.jsonnet` carries a worked end-to-end example
 under the `artifactory-prod` destination.
 
+#### Higher-level destination type for the common case
+
+For destinations that follow the canonical pattern — an RFC 8693
+token-exchange endpoint, broker-signed JWT as `subject_token`,
+form-encoded body — the `oidcTokenExchange` destination type
+packages the boilerplate into a type-safe block. Operators write
+only the fields downstream identity mappings actually look at:
+
+```jsonnet
+'token-exchange': {
+  oidcTokenExchange: {
+    url:          'https://destination.example.com/access/api/v1/oidc/token',
+    providerName: 'bb-credential-broker',
+    subjectToken: {
+      signedJWT: {
+        signingKey: 'broker-signing-key',
+        issuer:     'https://broker.example.com',
+        subject:    '${identity.principal}',
+        audience:   'destination-token-exchange',
+        ttl:        '5m',
+        claims: {
+          team: '${default:${identity.claims.team}:unknown}',
+        },
+      },
+    },
+    response: { tokenJsonPath: 'access_token', expiresInJsonPath: 'expires_in' },
+  },
+}
+```
+
+The broker compiles this down to an equivalent `httpTokenExchange`
+config at start-up: the form body is assembled correctly, the
+`subject_token` is constructed via `signjwt` + `json` with the
+right `iat` / `exp` / `kid`, and the response shape passes
+through verbatim. Bug fixes and feature additions to
+`httpTokenExchange` benefit both types because there is only one
+HTTP code path.
+
+Drop down to `httpTokenExchange` directly for destinations whose
+request shape needs custom headers, non-form bodies, or anything
+else the higher-level type does not cover.
+
 #### Registering the broker as an OIDC provider downstream
 
 For a JFrog deployment the recipe is:
@@ -302,12 +354,86 @@ against the claims you forward.
 
 #### Key rotation
 
-Single key, registered at startup. Rotation is a pod restart with
-the new key in place — same model the HMAC nonce-store signing
-key uses. The kid changes deterministically when the key changes,
-so downstream verifiers (which cache by kid) automatically
-re-fetch the JWKS the next time they see a JWT with an unknown
-kid.
+The `privateKeySecret` shape (single key) supports rotation by
+pod restart with the new key in place — same model the HMAC
+nonce-store signing key uses. The kid changes deterministically
+when the key changes, so downstream verifiers (which cache by
+kid) automatically re-fetch the JWKS the next time they see a
+JWT with an unknown kid. The trade-off is a window of up to the
+JWKS `Cache-Control: max-age` (default 300 seconds) during which
+downstream caches reject newly-signed JWTs.
+
+For zero-downtime rotation, use the `privateKeySecrets` list
+shape instead. The broker publishes every key in the JWKS while
+signing only with the first; operators rotate by reordering the
+list across two pod restarts:
+
+```jsonnet
+// Step 1: stage the new key as a second list entry, restart pods.
+// JWKS now publishes both keys; broker still signs with key-v1.
+brokerSigner: {
+  privateKeySecrets: ['broker-key-v1', 'broker-key-v2'],
+}
+
+// Step 2: wait the JWKS Cache-Control window (default 300s) for
+// downstream verifiers to re-fetch and learn the new key.
+
+// Step 3: reorder the list so the new key is first, restart pods.
+// Broker now signs with key-v2; key-v1 stays in the JWKS so any
+// straggler JWT signed during the change-over window still
+// verifies.
+brokerSigner: {
+  privateKeySecrets: ['broker-key-v2', 'broker-key-v1'],
+}
+
+// Step 4: wait the cache window again.
+
+// Step 5: drop the old key, restart pods. Single-key state.
+brokerSigner: {
+  privateKeySecrets: ['broker-key-v2'],
+}
+```
+
+`privateKeySecret` and `privateKeySecrets` are mutually exclusive
+— the broker rejects configurations that set both at load time.
+
+### Body encoding gotcha
+
+`body.json` rejects a specific footgun pattern at configuration
+load: a leaf string that contains BOTH a template expression
+(`${...}`) AND a literal `"` character. The configuration loader
+points operators at the offending leaf path and recommends
+`body.form` or `body.raw` instead.
+
+The reason is subtle: the broker stores `body.json` as
+JSON-serialised bytes and runs the template parser across them,
+but the parser tracks string-literal nesting inside function
+arguments via an unescaped `"` toggle. A template argument that
+includes literal `"` characters becomes `\"` after JSON encoding;
+the first `\"` flips the parser into "inside string", every
+subsequent `\"` keeps it there, and the parser eventually
+surfaces an `unterminated argument` error far from the offending
+byte.
+
+The check is deliberately narrow:
+
+- `"${secret:my-bearer-token}"` — passes (template but no literal quote).
+- `"${identity.principal}"` — passes (template but no literal quote).
+- `"static \"quoted\" value"` — passes (literal quotes but no template).
+- `"${signjwt:RS256:k:{\"iss\":\"x\"}}"` — rejected (template argument
+  carries inline JSON whose quotes will JSON-escape into the
+  footgun pattern).
+
+The shapes that work for templated bodies:
+
+- **`body.form`** — each key/value pair is templated in isolation
+  and URL-encoded at request time. The canonical shape for
+  RFC 8693 token-exchange endpoints.
+- **`body.raw`** — one opaque templated payload. Combine with an
+  explicit `Content-Type` header. The recommended shape when the
+  body needs to be JSON-shaped: use `${json:...}` (see the
+  Templating table) to construct the JSON object, set
+  `Content-Type: application/json` in `request.headers`.
 
 ### Nonce store
 
@@ -361,11 +487,14 @@ make docker-run    # run the development image with examples/config.jsonnet
 
 ## Operating
 
-The broker has a single executable with two subcommand forms:
+The broker has a single executable with three subcommand forms:
 
 ```sh
-bb-credential-broker <config.jsonnet>            # run the broker
-bb-credential-broker validate <config.jsonnet>   # check configuration
+bb-credential-broker <config.jsonnet>                        # run the broker
+bb-credential-broker validate <config.jsonnet>               # check configuration
+bb-credential-broker render --identity FILE \                # dry-run a destination
+  [--secret name=value ...] [--output request|jwt|url] \
+  <config.jsonnet> <destination>
 ```
 
 The `validate` subcommand loads the configuration and runs every
@@ -381,6 +510,30 @@ Run it in CI as a gate on changes to the deployment's configuration
 inputs, or as a `terragrunt plan` precondition so misconfiguration
 is caught at PR review time rather than when the broker pod fails
 to start in cluster.
+
+The `render` subcommand prints the exact HTTP request the broker
+would dispatch for a given destination + identity pair, without
+actually dispatching it. Use it to iterate on destination templates
+locally instead of redeploying the broker and tailing audit logs.
+The real secret loader is replaced with an in-memory map seeded
+from `--secret name=value` flags, so AWS credentials are not
+required. The `--identity` flag points at a JSON file shaped like
+the broker's internal `Identity`:
+
+```json
+{
+  "type":      "ci",
+  "principal": "repo:owner/repo:ref:refs/heads/main",
+  "claims":    {"actor": "alice", "repository": "owner/repo"}
+}
+```
+
+`--output` defaults to `request` (curl-friendly representation of
+the full HTTP request); `--output jwt` decodes any `subject_token`
+form field as a JWT and prints its header and claims; `--output url`
+prints just the resolved URL. Destinations that mint locally (the
+`staticSecret` type) have no HTTP request to render and surface a
+friendly message instead.
 
 ## Releases
 

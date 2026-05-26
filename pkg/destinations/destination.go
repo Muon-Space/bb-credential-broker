@@ -15,11 +15,14 @@ package destinations
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/auth"
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/destinations/httptokenexchange"
+	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/destinations/oidctokenexchange"
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/destinations/staticsecret"
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/metrics"
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/secrets"
@@ -39,6 +42,33 @@ type Destination interface {
 	// ExpiresAt records when the token ceases to be valid.
 	Mint(ctx context.Context, identity *auth.Identity) (*Token, error)
 }
+
+// Renderable is the optional contract a Destination implements
+// when the broker can dry-run its outbound HTTP request without
+// dispatching it. The `bb-credential-broker render` subcommand
+// type-asserts every looked-up destination against this
+// interface; destinations that mint locally (staticSecret)
+// return ErrNotRenderable.
+type Renderable interface {
+	Destination
+
+	// RenderRequest builds the *http.Request the destination
+	// would send to its upstream when Mint is invoked with the
+	// supplied identity, without actually dispatching it.
+	// Implementations evaluate templates, build the body and
+	// headers, and return the populated request so an operator
+	// can inspect it offline. Errors propagate any template or
+	// build failure the operator should see.
+	RenderRequest(ctx context.Context, identity *auth.Identity) (*http.Request, error)
+}
+
+// ErrNotRenderable is the sentinel destination implementations
+// return from RenderRequest when their mint flow does not
+// correspond to a single outbound HTTP request (the staticSecret
+// type, which simply reads bytes from disk). The render
+// subcommand maps the sentinel to a friendly operator-facing
+// message rather than printing it as a generic error.
+var ErrNotRenderable = errors.New("destination is not renderable as an HTTP request")
 
 // Token is the credential returned by Destination.Mint. It is also
 // the payload of /token's HTTP response.
@@ -129,6 +159,7 @@ func BuildRegistry(raw map[string]json.RawMessage, deps Dependencies) (Registry,
 type destinationConfig struct {
 	HTTPTokenExchange *httptokenexchange.Config `json:"httpTokenExchange,omitempty"`
 	StaticSecret      *staticsecret.Config      `json:"staticSecret,omitempty"`
+	OIDCTokenExchange *oidctokenexchange.Config `json:"oidcTokenExchange,omitempty"`
 }
 
 // buildOne dispatches a single destinations entry to the appropriate
@@ -141,9 +172,20 @@ func buildOne(name string, msg json.RawMessage, deps Dependencies) (Destination,
 	if err := dec.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("decode: %w", err)
 	}
-	switch {
-	case cfg.HTTPTokenExchange != nil && cfg.StaticSecret != nil:
+	set := 0
+	if cfg.HTTPTokenExchange != nil {
+		set++
+	}
+	if cfg.StaticSecret != nil {
+		set++
+	}
+	if cfg.OIDCTokenExchange != nil {
+		set++
+	}
+	if set > 1 {
 		return nil, fmt.Errorf("multiple destination type discriminators set; expected exactly one")
+	}
+	switch {
 	case cfg.HTTPTokenExchange != nil:
 		impl, err := httptokenexchange.New(name, cfg.HTTPTokenExchange, httptokenexchange.Dependencies{
 			Secrets:      deps.Secrets,
@@ -159,8 +201,17 @@ func buildOne(name string, msg json.RawMessage, deps Dependencies) (Destination,
 			return nil, err
 		}
 		return &staticSecretAdapter{impl: impl}, nil
+	case cfg.OIDCTokenExchange != nil:
+		impl, err := oidctokenexchange.New(name, cfg.OIDCTokenExchange, httptokenexchange.Dependencies{
+			Secrets:      deps.Secrets,
+			NamedSecrets: deps.NamedSecrets,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &httpTokenExchangeAdapter{impl: impl}, nil
 	default:
-		return nil, fmt.Errorf("no destination type discriminator set; expected one of: httpTokenExchange, staticSecret")
+		return nil, fmt.Errorf("no destination type discriminator set; expected one of: httpTokenExchange, staticSecret, oidcTokenExchange")
 	}
 }
 
@@ -189,6 +240,13 @@ func (a *httpTokenExchangeAdapter) Mint(ctx context.Context, identity *auth.Iden
 	}, nil
 }
 
+// RenderRequest implements Renderable for httpTokenExchange.
+// Returns the *http.Request the destination would dispatch to
+// its upstream when invoked with identity, without dispatching it.
+func (a *httpTokenExchangeAdapter) RenderRequest(ctx context.Context, identity *auth.Identity) (*http.Request, error) {
+	return a.impl.RenderRequest(ctx, identity)
+}
+
 // staticSecretAdapter converts the package-internal Token shape
 // returned by staticsecret.Impl.Mint into the public Token type.
 // Mirrors httpTokenExchangeAdapter; the indirection exists for the
@@ -210,6 +268,15 @@ func (a *staticSecretAdapter) Mint(ctx context.Context, identity *auth.Identity)
 	}, nil
 }
 
+// RenderRequest implements Renderable for staticSecret. The
+// destination performs no upstream HTTP request — it just reads a
+// file — so the sentinel is the operator-facing signal that
+// `bb-credential-broker render` cannot show an HTTP request for
+// this destination type.
+func (a *staticSecretAdapter) RenderRequest(_ context.Context, _ *auth.Identity) (*http.Request, error) {
+	return nil, ErrNotRenderable
+}
+
 // instrumentedDestination wraps an inner Destination with
 // per-destination Prometheus counters and a duration histogram. The
 // middleware is applied to every Destination produced by
@@ -226,4 +293,16 @@ func (d *instrumentedDestination) Mint(ctx context.Context, identity *auth.Ident
 	tok, err := d.inner.Mint(ctx, identity)
 	d.metrics.RecordMint(d.name, err, time.Since(start))
 	return tok, err
+}
+
+// RenderRequest forwards to the inner destination's Renderable
+// implementation. The metrics middleware does not record render
+// calls because they are an operator-side dry-run path, not
+// production mint traffic.
+func (d *instrumentedDestination) RenderRequest(ctx context.Context, identity *auth.Identity) (*http.Request, error) {
+	r, ok := d.inner.(Renderable)
+	if !ok {
+		return nil, ErrNotRenderable
+	}
+	return r.RenderRequest(ctx, identity)
 }

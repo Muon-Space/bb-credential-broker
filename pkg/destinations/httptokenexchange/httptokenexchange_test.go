@@ -97,9 +97,13 @@ func TestNew_ParsesTemplatesAtConstruction(t *testing.T) {
 
 func TestNew_ValidatesEveryBodyKind(t *testing.T) {
 	t.Parallel()
+	// body.json with templated leaf strings is rejected at
+	// configuration load (see TestNew_RejectsTemplatedValuesInBodyJSON);
+	// the body.json case here uses a non-templated payload to
+	// exercise the basic parse path without tripping that check.
 	for _, body := range []*httptokenexchange.BodyConfig{
 		{Form: map[string]string{"a": "${env:NONEXISTENT_OK}"}},
-		{JSON: json.RawMessage(`{"a":"${env:NONEXISTENT_OK}"}`)},
+		{JSON: json.RawMessage(`{"a":"static-value"}`)},
 		{Raw: "${env:NONEXISTENT_OK}"},
 	} {
 		cfg := &httptokenexchange.Config{
@@ -198,24 +202,22 @@ func TestNew_AcceptsDefaultWithTwoArgs(t *testing.T) {
 // typo class where a destination template references a built-in
 // function the broker does not implement. Without the
 // configuration-load-time check the error would surface only at
-// the first /token request, after deploy. The validator catches
-// typos like ${json:...} when the operator meant
-// ${jsonString:...}.
+// the first /token request, after deploy.
 func TestNew_RejectsUnknownTemplateFunction(t *testing.T) {
 	t.Parallel()
 	cfg := &httptokenexchange.Config{
 		Request: httptokenexchange.RequestConfig{
 			Method:  "POST",
-			URL:     "https://example.com/${json:value}",
+			URL:     "https://example.com/${jsonn:value}",
 			Headers: map[string]string{},
 		},
 		Response: httptokenexchange.ResponseConfig{TokenJSONPath: "token"},
 	}
 	_, err := httptokenexchange.New("x", cfg, newDeps())
 	if err == nil {
-		t.Fatal("expected error for unknown function ${json:...}, got nil")
+		t.Fatal("expected error for unknown function ${jsonn:...}, got nil")
 	}
-	if !strings.Contains(err.Error(), "json") {
+	if !strings.Contains(err.Error(), "jsonn") {
 		t.Errorf("error %q should name the unknown function", err.Error())
 	}
 	if !strings.Contains(err.Error(), "unknown template function") {
@@ -245,6 +247,125 @@ func TestNew_AcceptsAllBuiltinFunctions(t *testing.T) {
 	}
 	if _, err := httptokenexchange.New("x", cfg, newDeps()); err != nil {
 		t.Errorf("expected all built-ins to validate, got %v", err)
+	}
+}
+
+// TestNew_RejectsFootgunValuesInBodyJSON pins the documented
+// invariant from the README "Body encoding gotcha" section: a
+// body.json leaf string that carries BOTH a template expression
+// AND a literal " character is rejected at startup with an
+// actionable error pointing the operator at body.form or
+// body.raw. Without the check the template parser surfaces a
+// misleading "unterminated argument" at /token time, far from
+// the offending byte.
+func TestNew_RejectsFootgunValuesInBodyJSON(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		json string
+		want string // expected substring in the error message
+	}{
+		{
+			name: "signjwt with inline JSON claims (the canonical footgun)",
+			json: `{"subject_token":"${signjwt:RS256:${secret:k}:{\"iss\":\"x\"}}"}`,
+			want: "subject_token",
+		},
+		{
+			name: "footgun in nested object",
+			json: `{"outer":{"inner":"${func:{\"a\":\"b\"}}"}}`,
+			want: "outer.inner",
+		},
+		{
+			name: "footgun inside array element",
+			json: `{"items":["plain","${signjwt:k:{\"q\":1}}"]}`,
+			want: "items[1]",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := &httptokenexchange.Config{
+				Request: httptokenexchange.RequestConfig{
+					Method: "POST", URL: "https://example.com/",
+					Body: &httptokenexchange.BodyConfig{JSON: json.RawMessage(tc.json)},
+				},
+				Response: httptokenexchange.ResponseConfig{TokenJSONPath: "token"},
+			}
+			_, err := httptokenexchange.New("x", cfg, newDeps())
+			if err == nil {
+				t.Fatal("expected body.json footgun rejection, got nil")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q should mention the offending leaf path %q", err.Error(), tc.want)
+			}
+			if !strings.Contains(err.Error(), "body.form") {
+				t.Errorf("error %q should point operators at body.form / body.raw", err.Error())
+			}
+		})
+	}
+}
+
+// TestNew_AcceptsBenignTemplatesInBodyJSON confirms the narrow
+// check does NOT false-positive on the common legitimate
+// patterns: a templated leaf that produces a plain string with
+// no literal quotes is perfectly safe and continues to work in
+// body.json. The previous over-broad check rejected these
+// patterns spuriously and forced operators to switch to
+// body.form / body.raw for no reason.
+func TestNew_AcceptsBenignTemplatesInBodyJSON(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		json string
+	}{
+		{
+			// Skipped on the named-secret form because the
+			// ${secret:NAME} reference check would reject any
+			// secret name not in NamedSecrets (added in a
+			// previous PR). The footgun detector under test is
+			// independent of that check.
+			name: "env var forwarded as a JSON value",
+			json: `{"token":"${env:HOME}"}`,
+		},
+		{
+			name: "identity field forwarded as a JSON value",
+			json: `{"sub":"${identity.principal}"}`,
+		},
+		{
+			name: "numeric template",
+			json: `{"iat":"${now}"}`,
+		},
+		{
+			name: "nested templated leaf with no inline quotes",
+			json: `{"outer":{"inner":"${env:VAR}"}}`,
+		},
+		{
+			name: "template inside array",
+			json: `{"items":["plain","${env:HOME}"]}`,
+		},
+		{
+			name: "literal quotes but no template",
+			json: `{"static":"value with \"quoted\" inner"}`,
+		},
+		{
+			name: "fully static",
+			json: `{"hardcoded":"value","n":42}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := &httptokenexchange.Config{
+				Request: httptokenexchange.RequestConfig{
+					Method: "POST", URL: "https://example.com/",
+					Body: &httptokenexchange.BodyConfig{JSON: json.RawMessage(tc.json)},
+				},
+				Response: httptokenexchange.ResponseConfig{TokenJSONPath: "token"},
+			}
+			if _, err := httptokenexchange.New("x", cfg, newDeps()); err != nil {
+				t.Errorf("expected benign body.json to pass, got %v", err)
+			}
+		})
 	}
 }
 

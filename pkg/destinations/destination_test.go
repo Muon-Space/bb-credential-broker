@@ -80,6 +80,63 @@ func TestBuildRegistry_MissingDiscriminatorIsRejected(t *testing.T) {
 	}
 }
 
+// TestBuildRegistry_RejectsTypoInNestedField pins the strict-decode
+// invariant for the destinations envelope: a typo'd field at any
+// depth in the inner httpTokenExchange config tree must be
+// rejected at registry-build time rather than landing in
+// production as silently-dropped configuration.
+func TestBuildRegistry_RejectsTypoInNestedField(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "response.expireInJsonPath typo",
+			body: `{
+				"httpTokenExchange": {
+					"request": {"method": "POST", "url": "https://example.com/token"},
+					"response": {"tokenJsonPath": "access_token", "expireInJsonPath": "expires_in"}
+				}
+			}`,
+		},
+		{
+			name: "request.heders typo",
+			body: `{
+				"httpTokenExchange": {
+					"request": {"method": "POST", "url": "https://example.com/", "heders": {"X": "Y"}},
+					"response": {"tokenJsonPath": "access_token"}
+				}
+			}`,
+		},
+		{
+			name: "body.from typo (instead of form)",
+			body: `{
+				"httpTokenExchange": {
+					"request": {"method": "POST", "url": "https://example.com/", "body": {"from": {"k": "v"}}},
+					"response": {"tokenJsonPath": "access_token"}
+				}
+			}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			raw := map[string]json.RawMessage{"example": json.RawMessage(tc.body)}
+			_, err := destinations.BuildRegistry(raw, destinations.Dependencies{
+				Secrets:      secrets.NewMapLoader(),
+				NamedSecrets: map[string]secrets.SecretRef{},
+			})
+			if err == nil {
+				t.Fatal("expected typo to be rejected, got nil")
+			}
+			if !strings.Contains(err.Error(), "unknown field") {
+				t.Errorf("error %q should mention an unknown field", err.Error())
+			}
+		})
+	}
+}
+
 func TestBuildRegistry_MalformedTemplateIsRejected(t *testing.T) {
 	t.Parallel()
 

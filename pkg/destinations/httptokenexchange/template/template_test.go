@@ -218,6 +218,56 @@ func TestParse_DeeplyNestedTemplate(t *testing.T) {
 	}
 }
 
+// TestParse_ErrorsCarryOffsetAndContext asserts the documented
+// invariant that every parser-level error names the byte offset
+// the parser had reached and includes a short context window of
+// the surrounding input. Without this an operator bisecting a
+// long destination template has no way to localise the failure;
+// the parser does not maintain a line/column counter.
+func TestParse_ErrorsCarryOffsetAndContext(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		input   string
+		wantSub string // substring expected in the error context window
+	}{
+		{
+			name:    "stray closing brace",
+			input:   "ok-prefix-12345}suffix",
+			wantSub: "prefix",
+		},
+		{
+			name:    "unterminated function arg",
+			input:   "${signjwt:RS256:key:{\"iss\":\"x\"",
+			wantSub: "iss",
+		},
+		{
+			name:    "empty function name",
+			input:   "before-${}-after",
+			wantSub: "${",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := template.Parse(tc.input)
+			if err == nil {
+				t.Fatalf("expected parse error, got nil")
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, "offset") {
+				t.Errorf("error %q lacks offset annotation", msg)
+			}
+			if !strings.Contains(msg, "context") {
+				t.Errorf("error %q lacks context annotation", msg)
+			}
+			if !strings.Contains(msg, tc.wantSub) {
+				t.Errorf("error %q context should contain %q", msg, tc.wantSub)
+			}
+		})
+	}
+}
+
 func TestParse_LiteralBracesInOutput(t *testing.T) {
 	t.Parallel()
 	// A template with no '${' should pass braces through verbatim.

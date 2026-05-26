@@ -69,7 +69,16 @@ func newTestDeps() httptokenexchange.Dependencies {
 	}
 }
 
-func TestMint_HappyPath_JSONBodyAndExpiresIn(t *testing.T) {
+// TestMint_HappyPath_RawJSONBodyAndExpiresIn covers the end-to-end
+// flow for a JSON-shaped body that includes templated values. The
+// destination uses body.raw with an explicit application/json
+// Content-Type rather than body.json because body.json is the
+// wrong primitive for templated content (the template parser
+// confuses JSON-escaped \" sequences for unbalanced string
+// literals; httptokenexchange.New rejects templated body.json at
+// configuration load time with a pointer to body.form or
+// body.raw).
+func TestMint_HappyPath_RawJSONBodyAndExpiresIn(t *testing.T) {
 	t.Parallel()
 	fake := newFakeDestination(http.StatusOK, `{"access_token":"abc123","expires_in":3600,"token_type":"Bearer"}`)
 	defer fake.Close()
@@ -80,9 +89,10 @@ func TestMint_HappyPath_JSONBodyAndExpiresIn(t *testing.T) {
 			URL:    fake.URL() + "/token",
 			Headers: map[string]string{
 				"X-Originator": "${identity.principal}",
+				"Content-Type": "application/json",
 			},
 			Body: &httptokenexchange.BodyConfig{
-				JSON: json.RawMessage(`{"actor":"${identity.claims.actor}"}`),
+				Raw: `${json:actor:${identity.claims.actor}}`,
 			},
 		},
 		Response: httptokenexchange.ResponseConfig{
@@ -112,7 +122,6 @@ func TestMint_HappyPath_JSONBodyAndExpiresIn(t *testing.T) {
 			tok.ExpiresAt, expectedExpiry, after.Add(3600*time.Second))
 	}
 
-	// Confirm the upstream saw the templated header and body.
 	if got := fake.requestHeader.Get("X-Originator"); got != "repo:owner/repo:ref:refs/heads/main" {
 		t.Errorf("X-Originator header: got %q", got)
 	}
@@ -470,10 +479,12 @@ func TestMint_TemplatedJSONBodyMustParseAsJSON(t *testing.T) {
 			Method: "POST",
 			URL:    fake.URL() + "/",
 			Body: &httptokenexchange.BodyConfig{
-				// After substitution this resolves to a string
-				// that is not valid JSON ("alice" without quotes
-				// inside the JSON literal).
-				JSON: json.RawMessage(`{actor: ${identity.claims.actor}}`),
+				// Not valid JSON: keys and the string value lack
+				// quotes. The template engine accepts arbitrary
+				// text so this passes template.Parse; Mint's
+				// post-eval json.Unmarshal probe is the safety
+				// net that catches it before sending.
+				JSON: json.RawMessage(`{actor: alice}`),
 			},
 		},
 		Response: httptokenexchange.ResponseConfig{TokenJSONPath: "token"},
