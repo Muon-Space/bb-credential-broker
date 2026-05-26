@@ -229,7 +229,7 @@ operator coordination:
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: { form: {
         grant_type:         'urn:ietf:params:oauth:grant-type:token-exchange',
-        subject_token_type: 'urn:ietf:params:oauth:token-type:jwt',
+        subject_token_type: 'urn:ietf:params:oauth:token-type:id_token',
         subject_token:
           '${signjwt:RS256:${secret:broker-signing-key}:{' +
           '"iss":"https://broker.example.com",' +
@@ -265,7 +265,9 @@ for each depends on what the downstream OIDC provider validates:
   `urn:ietf:params:oauth:token-type:id_token` (OIDC ID Token).
   A broker-signed JWT is technically the former, but some
   downstreams (JFrog among them) historically accept only
-  `:id_token`. Match what your downstream's API documents.
+  `:id_token`. The example defaults to `:id_token` because it is
+  the broadly-accepted shape; operators whose downstream documents
+  `:jwt` set that value instead.
 - **`sub`.** Downstream identity-mapping engines typically gate
   on `sub`. Operators whose existing mappings expect a fixed
   service-account subject (`system:serviceaccount:NAMESPACE:NAME`,

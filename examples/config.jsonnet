@@ -131,12 +131,16 @@
           },
           body: { form: {
             grant_type:         'urn:ietf:params:oauth:grant-type:token-exchange',
-            // Some downstreams (JFrog among them) only accept
-            // 'urn:ietf:params:oauth:token-type:id_token' here
-            // even though the broker-signed JWT is technically a
-            // generic JWT. Match what your downstream's OIDC
-            // provider documents.
-            subject_token_type: 'urn:ietf:params:oauth:token-type:jwt',
+            // RFC 8693 §3 defines both
+            // 'urn:ietf:params:oauth:token-type:id_token' and
+            // 'urn:ietf:params:oauth:token-type:jwt'; some
+            // downstreams (JFrog among them) historically accept
+            // only the former even though the broker-signed JWT
+            // is technically the latter. The example defaults to
+            // :id_token because it is the broadly-accepted shape;
+            // operators whose downstream documents :jwt set that
+            // value instead.
+            subject_token_type: 'urn:ietf:params:oauth:token-type:id_token',
             // The signjwt template's third argument is a JSON
             // object literal. Number values (iat, exp) and the
             // hardcoded string fields are written verbatim; any
