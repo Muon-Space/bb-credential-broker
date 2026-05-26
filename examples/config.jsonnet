@@ -130,6 +130,17 @@
       oidcTokenExchange: {
         url:          'https://artifactory.example.com/access/api/v1/oidc/token',
         providerName: 'bb-credential-broker',
+        // subjectTokenType is omitted here so the broker uses the
+        // default 'urn:ietf:params:oauth:token-type:id_token'.
+        // RFC 8693 §3 defines both that value and
+        // 'urn:ietf:params:oauth:token-type:jwt'; the broker-
+        // signed JWT is technically the generic JWT type, but a
+        // number of downstreams (Artifactory among them)
+        // historically accept only :id_token. Operators whose
+        // downstream documents :jwt should set
+        //   subjectTokenType: 'urn:ietf:params:oauth:token-type:jwt'
+        // here to match what the downstream OIDC provider
+        // configuration validates.
         subjectToken: {
           signedJWT: {
             signingKey: 'broker-signing-key',
@@ -165,23 +176,20 @@
           url:    'https://api.github.com/app/installations/12345678/access_tokens',
           headers: {
             'Accept':        'application/vnd.github+json',
-            'Content-Type':  'application/json',
             'Authorization': 'Bearer ${signjwt:RS256:${secret:github-app-key}:${json:iss:"123456":iat:${now}:exp:${now+540s}}}',
           },
-          // body.raw with an explicit application/json Content-Type
-          // is the recommended shape for templated JSON bodies;
-          // body.json is rejected at configuration load for
-          // templated values (see README "Body encoding gotcha").
-          //
-          // GitHub's installation-token API expects a list of
-          // "owner/repo" strings under repositories. The ${json:...}
-          // helper builds the array as a one-element JSON array via
-          // a string-typed value, then this raw template wraps the
-          // outer object.
-          body: { raw:
-            '{"repositories":[${jsonString:${identity.claims.repository}}],' +
-            '"permissions":{"contents":"read"}}',
-          },
+          body: { json: {
+            // GitHub's installation-token API expects a list of
+            // "owner/repo" strings. The repository claim is the
+            // standard CI OIDC field; templates may reference any
+            // other claim if your IDP names it differently. The
+            // templated value evaluates to a plain string (no
+            // literal quote characters), so body.json's footgun
+            // detector accepts it — see README "Body encoding
+            // gotcha" for which patterns require body.raw instead.
+            repositories: ['${identity.claims.repository}'],
+            permissions:  { contents: 'read' },
+          } },
         },
         response: {
           expectStatus:      201,
@@ -199,12 +207,10 @@
           headers: {
             'Content-Type': 'application/json',
           },
-          // body.raw + explicit Content-Type for templated JSON
-          // (body.json is rejected at configuration load for
-          // templated values; see README "Body encoding gotcha").
-          body: { raw:
-            '${json:jwt:${file:/var/run/secrets/eks.amazonaws.com/serviceaccount/token}:role:"bb-credential-broker"}',
-          },
+          body: { json: {
+            jwt:  '${file:/var/run/secrets/eks.amazonaws.com/serviceaccount/token}',
+            role: 'bb-credential-broker',
+          } },
         },
         response: {
           expectStatus:      200,

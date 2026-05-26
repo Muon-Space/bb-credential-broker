@@ -399,18 +399,30 @@ brokerSigner: {
 
 ### Body encoding gotcha
 
-`body.json` is for non-templated JSON bodies only. The
-configuration loader rejects any `body.json` whose leaf strings
-contain `${...}` expressions at broker startup; the error points
-to the offending leaf path and recommends `body.form` or
-`body.raw` instead. The reason is subtle: the broker stores
-`body.json` as JSON-serialised bytes and runs the template parser
-across them, but the parser tracks string-literal nesting via an
-unescaped `"` toggle. A templated value whose evaluation contains
-a literal `"` becomes `\"` after JSON encoding, the first `\"`
-flips the parser into "inside string", every subsequent `\"`
-keeps it there, and the parser eventually surfaces an
-`unterminated argument` error far from the offending byte.
+`body.json` rejects a specific footgun pattern at configuration
+load: a leaf string that contains BOTH a template expression
+(`${...}`) AND a literal `"` character. The configuration loader
+points operators at the offending leaf path and recommends
+`body.form` or `body.raw` instead.
+
+The reason is subtle: the broker stores `body.json` as
+JSON-serialised bytes and runs the template parser across them,
+but the parser tracks string-literal nesting inside function
+arguments via an unescaped `"` toggle. A template argument that
+includes literal `"` characters becomes `\"` after JSON encoding;
+the first `\"` flips the parser into "inside string", every
+subsequent `\"` keeps it there, and the parser eventually
+surfaces an `unterminated argument` error far from the offending
+byte.
+
+The check is deliberately narrow:
+
+- `"${secret:my-bearer-token}"` — passes (template but no literal quote).
+- `"${identity.principal}"` — passes (template but no literal quote).
+- `"static \"quoted\" value"` — passes (literal quotes but no template).
+- `"${signjwt:RS256:k:{\"iss\":\"x\"}}"` — rejected (template argument
+  carries inline JSON whose quotes will JSON-escape into the
+  footgun pattern).
 
 The shapes that work for templated bodies:
 

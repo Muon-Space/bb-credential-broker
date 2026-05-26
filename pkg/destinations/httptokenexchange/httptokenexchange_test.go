@@ -250,15 +250,15 @@ func TestNew_AcceptsAllBuiltinFunctions(t *testing.T) {
 	}
 }
 
-// TestNew_RejectsTemplatedValuesInBodyJSON pins the documented
+// TestNew_RejectsFootgunValuesInBodyJSON pins the documented
 // invariant from the README "Body encoding gotcha" section: a
-// body.json whose leaf strings include ${...} expressions is
-// rejected at startup with an actionable error pointing the
-// operator at body.form or body.raw. Without the check the
-// template parser surfaces a misleading "unterminated argument"
-// at /token time when the JSON encoder's \" sequences confuse
-// the parser's string-literal tracking.
-func TestNew_RejectsTemplatedValuesInBodyJSON(t *testing.T) {
+// body.json leaf string that carries BOTH a template expression
+// AND a literal " character is rejected at startup with an
+// actionable error pointing the operator at body.form or
+// body.raw. Without the check the template parser surfaces a
+// misleading "unterminated argument" at /token time, far from
+// the offending byte.
+func TestNew_RejectsFootgunValuesInBodyJSON(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
 		name string
@@ -266,18 +266,18 @@ func TestNew_RejectsTemplatedValuesInBodyJSON(t *testing.T) {
 		want string // expected substring in the error message
 	}{
 		{
-			name: "templated leaf in top-level object",
-			json: `{"sub":"${identity.principal}"}`,
-			want: "sub",
+			name: "signjwt with inline JSON claims (the canonical footgun)",
+			json: `{"subject_token":"${signjwt:RS256:${secret:k}:{\"iss\":\"x\"}}"}`,
+			want: "subject_token",
 		},
 		{
-			name: "templated leaf in nested object",
-			json: `{"outer":{"inner":"${now}"}}`,
+			name: "footgun in nested object",
+			json: `{"outer":{"inner":"${func:{\"a\":\"b\"}}"}}`,
 			want: "outer.inner",
 		},
 		{
-			name: "templated leaf inside an array element",
-			json: `{"items":["plain","${env:HOME}"]}`,
+			name: "footgun inside array element",
+			json: `{"items":["plain","${signjwt:k:{\"q\":1}}"]}`,
 			want: "items[1]",
 		},
 	}
@@ -293,7 +293,7 @@ func TestNew_RejectsTemplatedValuesInBodyJSON(t *testing.T) {
 			}
 			_, err := httptokenexchange.New("x", cfg, newDeps())
 			if err == nil {
-				t.Fatal("expected body.json template-value rejection, got nil")
+				t.Fatal("expected body.json footgun rejection, got nil")
 			}
 			if !strings.Contains(err.Error(), tc.want) {
 				t.Errorf("error %q should mention the offending leaf path %q", err.Error(), tc.want)
@@ -305,20 +305,67 @@ func TestNew_RejectsTemplatedValuesInBodyJSON(t *testing.T) {
 	}
 }
 
-// TestNew_AcceptsBodyJSONWithoutTemplates confirms the validator
-// does not false-positive on body.json that is genuinely
-// template-free.
-func TestNew_AcceptsBodyJSONWithoutTemplates(t *testing.T) {
+// TestNew_AcceptsBenignTemplatesInBodyJSON confirms the narrow
+// check does NOT false-positive on the common legitimate
+// patterns: a templated leaf that produces a plain string with
+// no literal quotes is perfectly safe and continues to work in
+// body.json. The previous over-broad check rejected these
+// patterns spuriously and forced operators to switch to
+// body.form / body.raw for no reason.
+func TestNew_AcceptsBenignTemplatesInBodyJSON(t *testing.T) {
 	t.Parallel()
-	cfg := &httptokenexchange.Config{
-		Request: httptokenexchange.RequestConfig{
-			Method: "POST", URL: "https://example.com/",
-			Body: &httptokenexchange.BodyConfig{JSON: json.RawMessage(`{"hardcoded":"value","n":42}`)},
+	cases := []struct {
+		name string
+		json string
+	}{
+		{
+			// Skipped on the named-secret form because the
+			// ${secret:NAME} reference check would reject any
+			// secret name not in NamedSecrets (added in a
+			// previous PR). The footgun detector under test is
+			// independent of that check.
+			name: "env var forwarded as a JSON value",
+			json: `{"token":"${env:HOME}"}`,
 		},
-		Response: httptokenexchange.ResponseConfig{TokenJSONPath: "token"},
+		{
+			name: "identity field forwarded as a JSON value",
+			json: `{"sub":"${identity.principal}"}`,
+		},
+		{
+			name: "numeric template",
+			json: `{"iat":"${now}"}`,
+		},
+		{
+			name: "nested templated leaf with no inline quotes",
+			json: `{"outer":{"inner":"${env:VAR}"}}`,
+		},
+		{
+			name: "template inside array",
+			json: `{"items":["plain","${env:HOME}"]}`,
+		},
+		{
+			name: "literal quotes but no template",
+			json: `{"static":"value with \"quoted\" inner"}`,
+		},
+		{
+			name: "fully static",
+			json: `{"hardcoded":"value","n":42}`,
+		},
 	}
-	if _, err := httptokenexchange.New("x", cfg, newDeps()); err != nil {
-		t.Errorf("expected template-free body.json to pass, got %v", err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := &httptokenexchange.Config{
+				Request: httptokenexchange.RequestConfig{
+					Method: "POST", URL: "https://example.com/",
+					Body: &httptokenexchange.BodyConfig{JSON: json.RawMessage(tc.json)},
+				},
+				Response: httptokenexchange.ResponseConfig{TokenJSONPath: "token"},
+			}
+			if _, err := httptokenexchange.New("x", cfg, newDeps()); err != nil {
+				t.Errorf("expected benign body.json to pass, got %v", err)
+			}
+		})
 	}
 }
 
