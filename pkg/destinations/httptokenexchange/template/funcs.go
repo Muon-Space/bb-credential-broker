@@ -23,6 +23,7 @@ func DefaultFuncs() map[string]Func {
 		"file":       fileFunc,
 		"secret":     secretFunc,
 		"jsonString": jsonStringFunc,
+		"json":       jsonFunc,
 		"signjwt":    signJWTFunc,
 		"now":        nowFunc,
 		"b64":        b64Func,
@@ -53,6 +54,7 @@ type Validator func(args []*Template) error
 func DefaultValidators() map[string]Validator {
 	return map[string]Validator{
 		"default": validateDefaultArgs,
+		"json":    validateJSONArgs,
 	}
 }
 
@@ -77,12 +79,12 @@ func DefaultLazyFuncs() map[string]LazyFunc {
 // the function name.
 //
 // Callers use this at configuration-load time to surface typos
-// (${json:...} when the operator meant ${jsonString:...}, for
-// example) at broker startup rather than at the first /token
-// request that exercises the destination.
+// (${jsn:...} when the operator meant ${json:...}, for example)
+// at broker startup rather than at the first /token request that
+// exercises the destination.
 func IsBuiltinFunction(name string) bool {
 	switch name {
-	case "file", "secret", "jsonString", "signjwt", "now", "b64", "env":
+	case "file", "secret", "jsonString", "json", "signjwt", "now", "b64", "env":
 		return true
 	case "default":
 		return true
@@ -187,6 +189,94 @@ func jsonStringFunc(_ context.Context, _ *Scope, args []string) (string, error) 
 		return "", err
 	}
 	return string(b), nil
+}
+
+// jsonFunc returns a JSON object whose keys are the odd-indexed
+// arguments and whose values are derived from the even-indexed
+// arguments. Designed for the common case of constructing a JWT
+// claims body for signjwt without hand-writing braces, commas and
+// quotes:
+//
+//	${signjwt:RS256:${secret:k}:${json:iss:https://broker:iat:${now}:sub:${identity.principal}}}
+//
+// produces a third argument like
+//
+//	{"iss":"https://broker","iat":1779846000,"sub":"<principal>"}
+//
+// Key order in the emitted object follows the operator-supplied
+// argument order, not lexicographic sort, so the resulting JSON
+// matches what the operator wrote even when a downstream verifier
+// happens to care about ordering.
+//
+// Value auto-typing: each VALUE is evaluated as a template,
+// yielding a string. If the string parses as a valid JSON literal
+// (number, boolean, null, JSON-quoted string, JSON object, JSON
+// array) it is emitted verbatim. Otherwise it is wrapped as a
+// JSON string with the escaping json.Marshal applies. This lets
+// ${now} naturally land as a JSON number and ${identity.principal}
+// land as a properly-escaped JSON string with no operator-side
+// type bookkeeping.
+//
+// Arity is validated at configuration-load time by
+// validateJSONArgs; an odd argument count surfaces at broker
+// startup rather than at the first /token request that exercises
+// the template.
+func jsonFunc(_ context.Context, _ *Scope, args []string) (string, error) {
+	if len(args)%2 != 0 {
+		return "", fmt.Errorf("json: expected an even number of arguments (key/value pairs), got %d", len(args))
+	}
+	if len(args) == 0 {
+		return "{}", nil
+	}
+	var b strings.Builder
+	b.WriteByte('{')
+	for i := 0; i < len(args); i += 2 {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		keyEncoded, err := json.Marshal(args[i])
+		if err != nil {
+			return "", fmt.Errorf("json: encode key %q: %w", args[i], err)
+		}
+		b.Write(keyEncoded)
+		b.WriteByte(':')
+		b.WriteString(autoTypeJSONValue(args[i+1]))
+	}
+	b.WriteByte('}')
+	return b.String(), nil
+}
+
+// autoTypeJSONValue returns s verbatim when it parses as a valid
+// JSON literal, and the json.Marshal'd string form otherwise.
+// Whitespace around the input is trimmed before the parse attempt
+// so that values produced by adjacent template substitutions
+// (which can leave incidental spaces) still type-detect cleanly.
+func autoTypeJSONValue(s string) string {
+	trimmed := strings.TrimSpace(s)
+	if trimmed != "" && json.Valid([]byte(trimmed)) {
+		return trimmed
+	}
+	encoded, err := json.Marshal(s)
+	if err != nil {
+		// json.Marshal of a Go string cannot fail in practice
+		// (only invalid UTF-8 surfaces an error, and even that
+		// is replaced rather than rejected by recent Go
+		// versions). Fall back to a manually-quoted form so the
+		// output is still parseable JSON.
+		return `""`
+	}
+	return string(encoded)
+}
+
+// validateJSONArgs enforces the even-argument-count shape of
+// ${json:KEY:VALUE:KEY:VALUE:...} at configuration-load time so
+// an operator mistake surfaces at broker startup rather than at
+// the first /token request that exercises the template.
+func validateJSONArgs(args []*Template) error {
+	if len(args)%2 != 0 {
+		return fmt.Errorf("expected an even number of arguments (key/value pairs), got %d", len(args))
+	}
+	return nil
 }
 
 // nowFunc returns the current Unix epoch in seconds, optionally

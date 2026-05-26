@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"os"
 	"path/filepath"
@@ -235,6 +236,185 @@ func TestSignJWT_KIDIsRFC7638Thumbprint(t *testing.T) {
 	}
 	if gotKID != wantKID {
 		t.Errorf("kid: got %q, want %q (RFC 7638 thumbprint)", gotKID, wantKID)
+	}
+}
+
+// TestJSON_AutoTypesValues exercises the auto-typing rule that
+// distinguishes JSON literals from bare strings. A number that
+// resolves to a numeric string is emitted unquoted; a string
+// substitution is wrapped in quotes; a pre-quoted JSON string is
+// passed through verbatim; bools and null are recognised.
+func TestJSON_AutoTypesValues(t *testing.T) {
+	t.Parallel()
+	id := &auth.Identity{
+		Type:      auth.IdentityTypeCI,
+		Principal: "repo:owner/repo:ref:refs/heads/main",
+		Claims:    map[string]any{"team": "platform"},
+	}
+	cases := []struct {
+		name string
+		tmpl string
+		want string
+	}{
+		{
+			name: "empty object",
+			tmpl: `${json}`,
+			want: `{}`,
+		},
+		{
+			name: "string value gets quoted",
+			tmpl: `${json:sub:${identity.principal}}`,
+			want: `{"sub":"repo:owner/repo:ref:refs/heads/main"}`,
+		},
+		{
+			name: "numeric template stays unquoted",
+			tmpl: `${json:iat:${now}}`,
+			// fixedTime in the test scope returns 1700000000.
+			want: `{"iat":1700000000}`,
+		},
+		{
+			name: "pre-quoted string passes verbatim",
+			tmpl: `${json:iss:"https://broker.example.com"}`,
+			want: `{"iss":"https://broker.example.com"}`,
+		},
+		{
+			name: "boolean literal",
+			tmpl: `${json:active:true}`,
+			want: `{"active":true}`,
+		},
+		{
+			name: "null literal",
+			tmpl: `${json:tenant:null}`,
+			want: `{"tenant":null}`,
+		},
+		{
+			name: "string with characters json would escape",
+			tmpl: `${json:msg:hello "world"}`,
+			want: `{"msg":"hello \"world\""}`,
+		},
+		{
+			name: "key order follows operator-supplied order, not lexicographic",
+			tmpl: `${json:z:1:a:2:m:3}`,
+			want: `{"z":1,"a":2,"m":3}`,
+		},
+		{
+			name: "mixed types in one object",
+			tmpl: `${json:sub:${identity.principal}:iat:${now}:active:true}`,
+			want: `{"sub":"repo:owner/repo:ref:refs/heads/main","iat":1700000000,"active":true}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			tmpl := template.MustParse(tc.tmpl)
+			got, err := tmpl.Eval(context.Background(), newScope(t, id))
+			if err != nil {
+				t.Fatalf("Eval: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestJSON_OutputIsValidJSON cross-checks the auto-typing logic
+// by parsing the function output back through encoding/json. Any
+// future change that emits a malformed JSON document for a
+// representative claims body will trip this test before reaching
+// the destination service.
+func TestJSON_OutputIsValidJSON(t *testing.T) {
+	t.Parallel()
+	id := &auth.Identity{Type: auth.IdentityTypeCI, Principal: "p"}
+	tmpl := template.MustParse(
+		`${json:iss:"https://broker":sub:${identity.principal}:iat:${now}:active:true:tenant:null}`)
+	got, err := tmpl.Eval(context.Background(), newScope(t, id))
+	if err != nil {
+		t.Fatalf("Eval: %v", err)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(got), &parsed); err != nil {
+		t.Fatalf("output is not valid JSON: %v (got=%s)", err, got)
+	}
+	if parsed["iss"] != "https://broker" {
+		t.Errorf("iss: got %v", parsed["iss"])
+	}
+	if _, ok := parsed["iat"].(float64); !ok {
+		t.Errorf("iat: got %T %v, want JSON number", parsed["iat"], parsed["iat"])
+	}
+	if parsed["active"] != true {
+		t.Errorf("active: got %v", parsed["active"])
+	}
+	if parsed["tenant"] != nil {
+		t.Errorf("tenant: got %v, want JSON null", parsed["tenant"])
+	}
+}
+
+// TestJSON_OddArityRejectedAtNew covers the documented arity
+// invariant that surfaces at broker startup via the Validator
+// registry. Without the validator the error would surface only
+// at the first /token request that exercises the template.
+func TestJSON_OddArityRejectedAtNew(t *testing.T) {
+	t.Parallel()
+	// Three arguments — one key, one value, and a stray third
+	// item. Validation should reject this when the template is
+	// run through Template.Validate(template.DefaultValidators()).
+	tmpl := template.MustParse(`${json:k1:v1:k2}`)
+	err := tmpl.Validate(template.DefaultValidators())
+	if err == nil {
+		t.Fatal("expected odd-arity error from validator, got nil")
+	}
+	if !strings.Contains(err.Error(), "json") {
+		t.Errorf("error %q should mention json", err.Error())
+	}
+	if !strings.Contains(err.Error(), "even") {
+		t.Errorf("error %q should describe the even-pairs requirement", err.Error())
+	}
+}
+
+// TestJSON_IntegratesWithSignJWT confirms the canonical operator
+// use case: ${json:...} as the third argument to signjwt produces
+// a verifiable JWT whose decoded claims match the operator-
+// supplied key/value pairs.
+func TestJSON_IntegratesWithSignJWT(t *testing.T) {
+	t.Parallel()
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(priv),
+	})
+	loader := secrets.NewMapLoader()
+	ref := secrets.SecretRef{
+		AWSSecretsManager: &secrets.AWSSecretsManagerRef{ARN: "arn:test:k"},
+	}
+	loader.Set("aws:arn:test:k#", pemBytes)
+	id := &auth.Identity{Type: auth.IdentityTypeCI, Principal: "repo:foo/bar"}
+	scope := template.DefaultScope(id, loader, map[string]secrets.SecretRef{"k": ref})
+	scope.Now = fixedTime
+
+	tmpl := template.MustParse(
+		`${signjwt:RS256:${secret:k}:${json:iss:"https://broker":sub:${identity.principal}:iat:${now}}}`)
+	signed, err := tmpl.Eval(context.Background(), scope)
+	if err != nil {
+		t.Fatalf("Eval: %v", err)
+	}
+	parsed, err := jwt.Parse(signed, func(*jwt.Token) (any, error) { return &priv.PublicKey, nil })
+	if err != nil {
+		t.Fatalf("parse signed jwt: %v", err)
+	}
+	claims, _ := parsed.Claims.(jwt.MapClaims)
+	if claims["iss"] != "https://broker" {
+		t.Errorf("iss: got %v", claims["iss"])
+	}
+	if claims["sub"] != "repo:foo/bar" {
+		t.Errorf("sub: got %v", claims["sub"])
+	}
+	// iat must be a JSON number.
+	if iat, ok := claims["iat"].(float64); !ok || iat != 1700000000 {
+		t.Errorf("iat: got %T %v, want 1700000000", claims["iat"], claims["iat"])
 	}
 }
 

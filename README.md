@@ -92,6 +92,7 @@ expressions; the innermost expression is evaluated first.
 | `${b64:STR}` | Base64 encode the argument. | `${b64:user:pass}` |
 | `${env:VAR}` | Read an environment variable. Substituted at start-up rather than per request. | `${env:AWS_REGION}` |
 | `${default:EXPR:FALLBACK}` | Evaluate `EXPR`; return `FALLBACK` if `EXPR` fails for any reason (missing variable, missing secret, file read error, etc.). Both arguments are templates and may contain nested `${...}` expressions. | `${default:${identity.claims.classification}:unclassified}` |
+| `${json:KEY:VALUE:KEY:VALUE:...}` | Construct a JSON object. Each VALUE is a template; the result is auto-typed (numbers/booleans/null/pre-quoted strings/objects/arrays pass through verbatim, bare strings are JSON-escaped and quoted). Key order follows the operator-supplied argument order, not lexicographic sort. Used internally by the canonical broker-signed-JWT pattern to avoid hand-written braces, commas and quotes. | `${json:iat:${now}:sub:${identity.principal}}` |
 
 ### Static-secret destinations
 
@@ -239,13 +240,13 @@ operator coordination:
         grant_type:         'urn:ietf:params:oauth:grant-type:token-exchange',
         subject_token_type: 'urn:ietf:params:oauth:token-type:id_token',
         subject_token:
-          '${signjwt:RS256:${secret:broker-signing-key}:{' +
-          '"iss":"https://broker.example.com",' +
-          '"sub":${jsonString:${identity.principal}},' +
-          '"iat":${now},' +
-          '"exp":${now+300s},' +
-          '"aud":"destination-token-exchange",' +
-          '"team":${jsonString:${default:${identity.claims.team}:unknown}}' +
+          '${signjwt:RS256:${secret:broker-signing-key}:${json:' +
+          'iss:"https://broker.example.com":' +
+          'sub:${identity.principal}:' +
+          'iat:${now}:' +
+          'exp:${now+300s}:' +
+          'aud:"destination-token-exchange":' +
+          'team:${default:${identity.claims.team}:unknown}' +
           '}}',
         provider_name: 'bb-credential-broker',
       } },
@@ -255,12 +256,13 @@ operator coordination:
 }
 ```
 
-The third argument to `signjwt` is a JSON object literal. Number
-values (`iat`, `exp`) and hardcoded strings are written verbatim;
-any value that derives from runtime data is wrapped in
-`${jsonString:...}` so it lands in the JSON properly escaped and
-quoted. There is no `${json:...}` template function — operators
-who need richer construction factor it into Jsonnet locals.
+`${json:...}` is the recommended way to construct the signjwt
+claims body: it auto-types each value (numbers stay unquoted,
+runtime strings get JSON-escaped and quoted, pre-quoted literals
+pass through verbatim) and key order follows the operator-supplied
+argument order. Operators who prefer to write the JSON literally
+can still pass a JSON object as `signjwt`'s third argument
+directly and wrap runtime strings in `${jsonString:...}`.
 
 #### Tuning the JWT for a specific downstream
 

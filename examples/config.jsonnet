@@ -147,29 +147,25 @@
             // operators whose downstream documents :jwt set that
             // value instead.
             subject_token_type: 'urn:ietf:params:oauth:token-type:id_token',
-            // The signjwt template's third argument is a JSON
-            // object literal. Number values (iat, exp) and the
-            // hardcoded string fields are written verbatim; any
-            // value that derives from runtime data is wrapped in
-            // ${jsonString:...} so it lands in the JSON properly
-            // escaped and quoted.
-            //
-            // Operators tune 'sub' and 'aud' to match what the
-            // downstream identity-mapping engine evaluates. The
-            // example below sets 'sub' to the originating CI
-            // principal so downstream mappings can pivot on it;
-            // operators whose existing mappings already gate on a
-            // fixed broker service-account sub can instead hard
-            // code that value here and keep their mappings
-            // unchanged.
+            // ${json:KEY:VALUE:KEY:VALUE:...} constructs the
+            // signjwt claims object with auto-typed values: bare
+            // numbers like ${now} land as JSON numbers, runtime
+            // strings are escaped and quoted, pre-quoted literals
+            // pass through verbatim. Operators tune 'sub' and
+            // 'aud' to match what the downstream identity-mapping
+            // engine evaluates — the example below forwards the
+            // originating CI principal as 'sub' so mappings can
+            // pivot on it; operators whose mappings already gate
+            // on a fixed broker service-account 'sub' hard code
+            // that string instead.
             subject_token:
-              '${signjwt:RS256:${secret:broker-signing-key}:{' +
-              '"iss":"https://bb-credential-broker.example.com",' +
-              '"sub":${jsonString:${identity.principal}},' +
-              '"iat":${now},' +
-              '"exp":${now+300s},' +
-              '"aud":"artifactory-token-exchange",' +
-              '"team":${jsonString:${default:${identity.claims.team}:unknown}}' +
+              '${signjwt:RS256:${secret:broker-signing-key}:${json:' +
+              'iss:"https://bb-credential-broker.example.com":' +
+              'sub:${identity.principal}:' +
+              'iat:${now}:' +
+              'exp:${now+300s}:' +
+              'aud:"artifactory-token-exchange":' +
+              'team:${default:${identity.claims.team}:unknown}' +
               '}}',
             provider_name: 'bb-credential-broker',
           } },

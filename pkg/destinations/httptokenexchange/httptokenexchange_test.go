@@ -198,24 +198,22 @@ func TestNew_AcceptsDefaultWithTwoArgs(t *testing.T) {
 // typo class where a destination template references a built-in
 // function the broker does not implement. Without the
 // configuration-load-time check the error would surface only at
-// the first /token request, after deploy. The validator catches
-// typos like ${json:...} when the operator meant
-// ${jsonString:...}.
+// the first /token request, after deploy.
 func TestNew_RejectsUnknownTemplateFunction(t *testing.T) {
 	t.Parallel()
 	cfg := &httptokenexchange.Config{
 		Request: httptokenexchange.RequestConfig{
 			Method:  "POST",
-			URL:     "https://example.com/${json:value}",
+			URL:     "https://example.com/${jsonn:value}",
 			Headers: map[string]string{},
 		},
 		Response: httptokenexchange.ResponseConfig{TokenJSONPath: "token"},
 	}
 	_, err := httptokenexchange.New("x", cfg, newDeps())
 	if err == nil {
-		t.Fatal("expected error for unknown function ${json:...}, got nil")
+		t.Fatal("expected error for unknown function ${jsonn:...}, got nil")
 	}
-	if !strings.Contains(err.Error(), "json") {
+	if !strings.Contains(err.Error(), "jsonn") {
 		t.Errorf("error %q should name the unknown function", err.Error())
 	}
 	if !strings.Contains(err.Error(), "unknown template function") {
