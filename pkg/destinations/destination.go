@@ -22,6 +22,7 @@ import (
 
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/auth"
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/destinations/httptokenexchange"
+	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/destinations/oidctokenexchange"
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/destinations/staticsecret"
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/metrics"
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/secrets"
@@ -158,6 +159,7 @@ func BuildRegistry(raw map[string]json.RawMessage, deps Dependencies) (Registry,
 type destinationConfig struct {
 	HTTPTokenExchange *httptokenexchange.Config `json:"httpTokenExchange,omitempty"`
 	StaticSecret      *staticsecret.Config      `json:"staticSecret,omitempty"`
+	OIDCTokenExchange *oidctokenexchange.Config `json:"oidcTokenExchange,omitempty"`
 }
 
 // buildOne dispatches a single destinations entry to the appropriate
@@ -170,9 +172,20 @@ func buildOne(name string, msg json.RawMessage, deps Dependencies) (Destination,
 	if err := dec.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("decode: %w", err)
 	}
-	switch {
-	case cfg.HTTPTokenExchange != nil && cfg.StaticSecret != nil:
+	set := 0
+	if cfg.HTTPTokenExchange != nil {
+		set++
+	}
+	if cfg.StaticSecret != nil {
+		set++
+	}
+	if cfg.OIDCTokenExchange != nil {
+		set++
+	}
+	if set > 1 {
 		return nil, fmt.Errorf("multiple destination type discriminators set; expected exactly one")
+	}
+	switch {
 	case cfg.HTTPTokenExchange != nil:
 		impl, err := httptokenexchange.New(name, cfg.HTTPTokenExchange, httptokenexchange.Dependencies{
 			Secrets:      deps.Secrets,
@@ -188,8 +201,17 @@ func buildOne(name string, msg json.RawMessage, deps Dependencies) (Destination,
 			return nil, err
 		}
 		return &staticSecretAdapter{impl: impl}, nil
+	case cfg.OIDCTokenExchange != nil:
+		impl, err := oidctokenexchange.New(name, cfg.OIDCTokenExchange, httptokenexchange.Dependencies{
+			Secrets:      deps.Secrets,
+			NamedSecrets: deps.NamedSecrets,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &httpTokenExchangeAdapter{impl: impl}, nil
 	default:
-		return nil, fmt.Errorf("no destination type discriminator set; expected one of: httpTokenExchange, staticSecret")
+		return nil, fmt.Errorf("no destination type discriminator set; expected one of: httpTokenExchange, staticSecret, oidcTokenExchange")
 	}
 }
 

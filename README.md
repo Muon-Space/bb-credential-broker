@@ -291,6 +291,48 @@ for each depends on what the downstream OIDC provider validates:
 `examples/config.jsonnet` carries a worked end-to-end example
 under the `artifactory-prod` destination.
 
+#### Higher-level destination type for the common case
+
+For destinations that follow the canonical pattern — an RFC 8693
+token-exchange endpoint, broker-signed JWT as `subject_token`,
+form-encoded body — the `oidcTokenExchange` destination type
+packages the boilerplate into a type-safe block. Operators write
+only the fields downstream identity mappings actually look at:
+
+```jsonnet
+'token-exchange': {
+  oidcTokenExchange: {
+    url:          'https://destination.example.com/access/api/v1/oidc/token',
+    providerName: 'bb-credential-broker',
+    subjectToken: {
+      signedJWT: {
+        signingKey: 'broker-signing-key',
+        issuer:     'https://broker.example.com',
+        subject:    '${identity.principal}',
+        audience:   'destination-token-exchange',
+        ttl:        '5m',
+        claims: {
+          team: '${default:${identity.claims.team}:unknown}',
+        },
+      },
+    },
+    response: { tokenJsonPath: 'access_token', expiresInJsonPath: 'expires_in' },
+  },
+}
+```
+
+The broker compiles this down to an equivalent `httpTokenExchange`
+config at start-up: the form body is assembled correctly, the
+`subject_token` is constructed via `signjwt` + `json` with the
+right `iat` / `exp` / `kid`, and the response shape passes
+through verbatim. Bug fixes and feature additions to
+`httpTokenExchange` benefit both types because there is only one
+HTTP code path.
+
+Drop down to `httpTokenExchange` directly for destinations whose
+request shape needs custom headers, non-form bodies, or anything
+else the higher-level type does not cover.
+
 #### Registering the broker as an OIDC provider downstream
 
 For a JFrog deployment the recipe is:

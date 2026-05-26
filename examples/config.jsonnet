@@ -111,67 +111,47 @@
   },
 
   destinations: {
-    // OAuth 2.0 token-exchange destination whose downstream
-    // (Artifactory's /access/api/v1/oidc/token, but the same
-    // shape applies to any RFC 8693 endpoint that evaluates
-    // identity-mapping claims only against subject_token) gets a
-    // broker-signed JWT as subject_token. The broker mints the
-    // JWT inline via ${signjwt:RS256:...}, embedding the
-    // forwarded identity claims plus standard iss/iat/exp; the
-    // downstream verifier fetches the broker's published JWKS to
-    // validate the signature.
+    // Canonical OAuth 2.0 / RFC 8693 token-exchange destination
+    // (Artifactory's /access/api/v1/oidc/token is the worked
+    // example, but the same shape applies to any RFC 8693
+    // endpoint that evaluates identity-mapping claims only
+    // against the JWT carried in subject_token). The
+    // oidcTokenExchange destination type packages the
+    // boilerplate — form encoding, signjwt construction,
+    // iat/exp wiring, kid alignment with /.well-known/jwks.json
+    // — into a type-safe config block; operators write only the
+    // fields downstream identity mappings actually look at.
     //
-    // Body-level "additional_claims" or similar request
-    // extensions are NOT used: services in this category silently
-    // drop unknown request-body fields and evaluate mappings
-    // against subject_token claims only, so any identity
-    // attribute that must reach a mapping rule has to be inside
-    // the signed token.
+    // For destinations whose request shape needs custom headers
+    // or a non-form body, drop down to the lower-level
+    // httpTokenExchange type (see the github-app example below
+    // for that shape).
     'artifactory-prod': {
-      httpTokenExchange: {
-        request: {
-          method: 'POST',
-          url:    'https://artifactory.example.com/access/api/v1/oidc/token',
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
+      oidcTokenExchange: {
+        url:          'https://artifactory.example.com/access/api/v1/oidc/token',
+        providerName: 'bb-credential-broker',
+        subjectToken: {
+          signedJWT: {
+            signingKey: 'broker-signing-key',
+            issuer:     'https://bb-credential-broker.example.com',
+            // 'subject' is the JWT's sub claim. Operators tune
+            // this to whatever the downstream identity-mapping
+            // engine pivots on. Forwarding the originating CI
+            // principal lets mappings gate per-build; hard-
+            // coding a service-account string is the right
+            // choice when existing mappings already expect one.
+            subject:    '${identity.principal}',
+            audience:   'artifactory-token-exchange',
+            ttl:        '5m',
+            claims: {
+              // Each value is a template; the broker auto-types
+              // it (numbers stay unquoted, runtime strings get
+              // JSON-escaped and quoted).
+              team: '${default:${identity.claims.team}:unknown}',
+            },
           },
-          body: { form: {
-            grant_type:         'urn:ietf:params:oauth:grant-type:token-exchange',
-            // RFC 8693 §3 defines both
-            // 'urn:ietf:params:oauth:token-type:id_token' and
-            // 'urn:ietf:params:oauth:token-type:jwt'; some
-            // downstreams (JFrog among them) historically accept
-            // only the former even though the broker-signed JWT
-            // is technically the latter. The example defaults to
-            // :id_token because it is the broadly-accepted shape;
-            // operators whose downstream documents :jwt set that
-            // value instead.
-            subject_token_type: 'urn:ietf:params:oauth:token-type:id_token',
-            // ${json:KEY:VALUE:KEY:VALUE:...} constructs the
-            // signjwt claims object with auto-typed values: bare
-            // numbers like ${now} land as JSON numbers, runtime
-            // strings are escaped and quoted, pre-quoted literals
-            // pass through verbatim. Operators tune 'sub' and
-            // 'aud' to match what the downstream identity-mapping
-            // engine evaluates — the example below forwards the
-            // originating CI principal as 'sub' so mappings can
-            // pivot on it; operators whose mappings already gate
-            // on a fixed broker service-account 'sub' hard code
-            // that string instead.
-            subject_token:
-              '${signjwt:RS256:${secret:broker-signing-key}:${json:' +
-              'iss:"https://bb-credential-broker.example.com":' +
-              'sub:${identity.principal}:' +
-              'iat:${now}:' +
-              'exp:${now+300s}:' +
-              'aud:"artifactory-token-exchange":' +
-              'team:${default:${identity.claims.team}:unknown}' +
-              '}}',
-            provider_name: 'bb-credential-broker',
-          } },
         },
         response: {
-          expectStatus:      200,
           tokenJsonPath:     'access_token',
           expiresInJsonPath: 'expires_in',
         },
@@ -185,17 +165,23 @@
           url:    'https://api.github.com/app/installations/12345678/access_tokens',
           headers: {
             'Accept':        'application/vnd.github+json',
-            'Authorization': 'Bearer ${signjwt:RS256:${secret:github-app-key}:{"iss":"123456","iat":${now},"exp":${now+540s}}}',
+            'Content-Type':  'application/json',
+            'Authorization': 'Bearer ${signjwt:RS256:${secret:github-app-key}:${json:iss:"123456":iat:${now}:exp:${now+540s}}}',
           },
-          body: { json: {
-            // GitHub's installation-token API expects a list of
-            // "owner/repo" strings. Many CI OIDC tokens emit this
-            // as the standard "repository" claim; templates may
-            // reference any other claim if your IDP names it
-            // differently.
-            repositories: ['${identity.claims.repository}'],
-            permissions:  { contents: 'read' },
-          } },
+          // body.raw with an explicit application/json Content-Type
+          // is the recommended shape for templated JSON bodies;
+          // body.json is rejected at configuration load for
+          // templated values (see README "Body encoding gotcha").
+          //
+          // GitHub's installation-token API expects a list of
+          // "owner/repo" strings under repositories. The ${json:...}
+          // helper builds the array as a one-element JSON array via
+          // a string-typed value, then this raw template wraps the
+          // outer object.
+          body: { raw:
+            '{"repositories":[${jsonString:${identity.claims.repository}}],' +
+            '"permissions":{"contents":"read"}}',
+          },
         },
         response: {
           expectStatus:      201,
@@ -213,10 +199,12 @@
           headers: {
             'Content-Type': 'application/json',
           },
-          body: { json: {
-            jwt:  '${file:/var/run/secrets/eks.amazonaws.com/serviceaccount/token}',
-            role: 'bb-credential-broker',
-          } },
+          // body.raw + explicit Content-Type for templated JSON
+          // (body.json is rejected at configuration load for
+          // templated values; see README "Body encoding gotcha").
+          body: { raw:
+            '${json:jwt:${file:/var/run/secrets/eks.amazonaws.com/serviceaccount/token}:role:"bb-credential-broker"}',
+          },
         },
         response: {
           expectStatus:      200,
