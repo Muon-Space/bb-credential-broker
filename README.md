@@ -230,14 +230,15 @@ operator coordination:
       body: { form: {
         grant_type:         'urn:ietf:params:oauth:grant-type:token-exchange',
         subject_token_type: 'urn:ietf:params:oauth:token-type:jwt',
-        subject_token: '${signjwt:RS256:${secret:broker-signing-key}:${json:{' +
-                       'iss:"https://broker.example.com",' +
-                       'sub:${jsonString:${identity.principal}},' +
-                       'iat:${now},' +
-                       'exp:${now+300s},' +
-                       'aud:"destination-token-exchange",' +
-                       'team:${jsonString:${default:${identity.claims.team}:unknown}}' +
-                       '}}}',
+        subject_token:
+          '${signjwt:RS256:${secret:broker-signing-key}:{' +
+          '"iss":"https://broker.example.com",' +
+          '"sub":${jsonString:${identity.principal}},' +
+          '"iat":${now},' +
+          '"exp":${now+300s},' +
+          '"aud":"destination-token-exchange",' +
+          '"team":${jsonString:${default:${identity.claims.team}:unknown}}' +
+          '}}',
         provider_name: 'bb-credential-broker',
       } },
     },
@@ -245,6 +246,35 @@ operator coordination:
   },
 }
 ```
+
+The third argument to `signjwt` is a JSON object literal. Number
+values (`iat`, `exp`) and hardcoded strings are written verbatim;
+any value that derives from runtime data is wrapped in
+`${jsonString:...}` so it lands in the JSON properly escaped and
+quoted. There is no `${json:...}` template function — operators
+who need richer construction factor it into Jsonnet locals.
+
+#### Tuning the JWT for a specific downstream
+
+`subject_token_type`, `sub`, and `aud` are deliberately
+operator-tunable in the template above because the right value
+for each depends on what the downstream OIDC provider validates:
+
+- **`subject_token_type`.** RFC 8693 §3 defines both
+  `urn:ietf:params:oauth:token-type:jwt` (generic JWT) and
+  `urn:ietf:params:oauth:token-type:id_token` (OIDC ID Token).
+  A broker-signed JWT is technically the former, but some
+  downstreams (JFrog among them) historically accept only
+  `:id_token`. Match what your downstream's API documents.
+- **`sub`.** Downstream identity-mapping engines typically gate
+  on `sub`. Operators whose existing mappings expect a fixed
+  service-account subject (`system:serviceaccount:NAMESPACE:NAME`,
+  for example) hard-code that string. Operators who want each
+  mapping to pivot on the originating CI principal forward
+  `${jsonString:${identity.principal}}` as the example does.
+- **`aud`.** Set this to whatever the downstream OIDC provider
+  registers as its expected audience, or omit it entirely if the
+  provider does not validate audience.
 
 `examples/config.jsonnet` carries a worked end-to-end example
 under the `artifactory-prod` destination.

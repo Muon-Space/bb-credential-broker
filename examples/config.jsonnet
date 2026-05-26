@@ -131,15 +131,36 @@
           },
           body: { form: {
             grant_type:         'urn:ietf:params:oauth:grant-type:token-exchange',
+            // Some downstreams (JFrog among them) only accept
+            // 'urn:ietf:params:oauth:token-type:id_token' here
+            // even though the broker-signed JWT is technically a
+            // generic JWT. Match what your downstream's OIDC
+            // provider documents.
             subject_token_type: 'urn:ietf:params:oauth:token-type:jwt',
-            subject_token: '${signjwt:RS256:${secret:broker-signing-key}:${json:{' +
-                           'iss:"https://bb-credential-broker.example.com",' +
-                           'sub:${jsonString:${identity.principal}},' +
-                           'iat:${now},' +
-                           'exp:${now+300s},' +
-                           'aud:"artifactory-token-exchange",' +
-                           'team:${jsonString:${default:${identity.claims.team}:unknown}}' +
-                           '}}}',
+            // The signjwt template's third argument is a JSON
+            // object literal. Number values (iat, exp) and the
+            // hardcoded string fields are written verbatim; any
+            // value that derives from runtime data is wrapped in
+            // ${jsonString:...} so it lands in the JSON properly
+            // escaped and quoted.
+            //
+            // Operators tune 'sub' and 'aud' to match what the
+            // downstream identity-mapping engine evaluates. The
+            // example below sets 'sub' to the originating CI
+            // principal so downstream mappings can pivot on it;
+            // operators whose existing mappings already gate on a
+            // fixed broker service-account sub can instead hard
+            // code that value here and keep their mappings
+            // unchanged.
+            subject_token:
+              '${signjwt:RS256:${secret:broker-signing-key}:{' +
+              '"iss":"https://bb-credential-broker.example.com",' +
+              '"sub":${jsonString:${identity.principal}},' +
+              '"iat":${now},' +
+              '"exp":${now+300s},' +
+              '"aud":"artifactory-token-exchange",' +
+              '"team":${jsonString:${default:${identity.claims.team}:unknown}}' +
+              '}}',
             provider_name: 'bb-credential-broker',
           } },
         },

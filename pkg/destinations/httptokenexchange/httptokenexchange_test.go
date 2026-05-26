@@ -194,6 +194,60 @@ func TestNew_AcceptsDefaultWithTwoArgs(t *testing.T) {
 	}
 }
 
+// TestNew_RejectsUnknownTemplateFunction surfaces the operator
+// typo class where a destination template references a built-in
+// function the broker does not implement. Without the
+// configuration-load-time check the error would surface only at
+// the first /token request, after deploy. The validator catches
+// typos like ${json:...} when the operator meant
+// ${jsonString:...}.
+func TestNew_RejectsUnknownTemplateFunction(t *testing.T) {
+	t.Parallel()
+	cfg := &httptokenexchange.Config{
+		Request: httptokenexchange.RequestConfig{
+			Method:  "POST",
+			URL:     "https://example.com/${json:value}",
+			Headers: map[string]string{},
+		},
+		Response: httptokenexchange.ResponseConfig{TokenJSONPath: "token"},
+	}
+	_, err := httptokenexchange.New("x", cfg, newDeps())
+	if err == nil {
+		t.Fatal("expected error for unknown function ${json:...}, got nil")
+	}
+	if !strings.Contains(err.Error(), "json") {
+		t.Errorf("error %q should name the unknown function", err.Error())
+	}
+	if !strings.Contains(err.Error(), "unknown template function") {
+		t.Errorf("error %q should say unknown template function", err.Error())
+	}
+}
+
+// TestNew_AcceptsAllBuiltinFunctions confirms the validator does
+// not false-positive on any of the documented function names,
+// including the dynamically-registered ${now+DUR} shorthand and
+// the lazy-evaluated ${default:...}.
+func TestNew_AcceptsAllBuiltinFunctions(t *testing.T) {
+	t.Parallel()
+	cfg := &httptokenexchange.Config{
+		Request: httptokenexchange.RequestConfig{
+			Method: "POST",
+			URL:    "https://example.com/${env:UNSET_OK}",
+			Headers: map[string]string{
+				"X-Now":     "${now}",
+				"X-NowOff":  "${now+30s}",
+				"X-B64":     "${b64:hello}",
+				"X-JSONStr": "${jsonString:hello}",
+				"X-Default": "${default:${identity.claims.absent}:fallback}",
+			},
+		},
+		Response: httptokenexchange.ResponseConfig{TokenJSONPath: "token"},
+	}
+	if _, err := httptokenexchange.New("x", cfg, newDeps()); err != nil {
+		t.Errorf("expected all built-ins to validate, got %v", err)
+	}
+}
+
 // TestNew_RejectsUndefinedSecretReference verifies the secret-name
 // resolution check that ships alongside this destination's
 // configuration-load walk. A ${secret:NAME} whose NAME is a static

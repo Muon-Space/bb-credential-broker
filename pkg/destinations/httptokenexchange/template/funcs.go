@@ -71,6 +71,29 @@ func DefaultLazyFuncs() map[string]LazyFunc {
 	}
 }
 
+// IsBuiltinFunction reports whether name is one of the built-in
+// template functions the broker ships, including the dynamically
+// registered ${now+DUR} shorthand whose duration suffix is part of
+// the function name.
+//
+// Callers use this at configuration-load time to surface typos
+// (${json:...} when the operator meant ${jsonString:...}, for
+// example) at broker startup rather than at the first /token
+// request that exercises the destination.
+func IsBuiltinFunction(name string) bool {
+	switch name {
+	case "file", "secret", "jsonString", "signjwt", "now", "b64", "env":
+		return true
+	case "default":
+		return true
+	}
+	// ${now+DUR} is registered on demand at evaluation time from
+	// the suffix; the post-parse validator only needs to know
+	// the shape is well-formed. A bad duration suffix surfaces
+	// later via RegisterNowOffset's ParseDuration call.
+	return strings.HasPrefix(name, "now+")
+}
+
 // defaultFunc evaluates the primary expression and returns its
 // value on success, falling back to the second argument when the
 // primary expression returns any error (a missing variable
