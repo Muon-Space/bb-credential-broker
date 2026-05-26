@@ -11,6 +11,7 @@
 package secrets
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 )
@@ -61,13 +62,23 @@ func (r *SecretRef) Validate() error {
 }
 
 // UnmarshalJSON enforces that the input either omits the SecretRef
-// entirely or specifies exactly one backend. JSON parsing of a
-// SecretRef succeeds even when the contents are invalid; callers that
-// need strict validation should also call Validate.
+// entirely or specifies exactly one backend, and uses a strict
+// decoder so that a typo'd field inside the chosen backend (a
+// common operator mistake — "feild" instead of "field", for
+// example) surfaces as a configuration error rather than being
+// silently ignored. The strict decoder is required here because
+// json.Unmarshal does NOT propagate the outer decoder's
+// DisallowUnknownFields setting through to custom UnmarshalJSON
+// implementations.
+//
+// Callers that also need semantic validation (exactly one backend
+// set, required fields populated) should also call Validate.
 func (r *SecretRef) UnmarshalJSON(data []byte) error {
 	type alias SecretRef
 	var a alias
-	if err := json.Unmarshal(data, &a); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&a); err != nil {
 		return err
 	}
 	*r = SecretRef(a)

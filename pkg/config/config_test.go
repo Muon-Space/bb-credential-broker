@@ -3,6 +3,7 @@ package config_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/config"
@@ -125,6 +126,35 @@ func TestLoad_RejectsUnknownTopLevelField(t *testing.T) {
 	_, err := config.Load(writeConfig(t, body))
 	if err == nil {
 		t.Fatal("expected unknown-field error, got nil")
+	}
+}
+
+// TestLoad_RejectsTypoInSecretRef pins the invariant for
+// SecretRef.UnmarshalJSON: typos inside a SecretRef's backend
+// block must not be silently ignored. The custom UnmarshalJSON
+// installs its own strict decoder because json.Unmarshal does not
+// propagate the outer Decoder's DisallowUnknownFields setting.
+func TestLoad_RejectsTypoInSecretRef(t *testing.T) {
+	t.Parallel()
+	body := `{
+  apiServer:         { listenAddress: ':8080' },
+  diagnosticsServer: { listenAddress: ':9980' },
+  tokenAllowedCIDRs: ['10.0.0.0/8'],
+  jwtAuth: { issuers: [{ url: 'x', jwksFile: '/etc/jwks/x.json', identityType: 'ci' }] },
+  nonceStore: { signed: { signingKeyFile: '/etc/broker/key', ttl: '5m' } },
+  secrets: {
+    'k': {
+      // 'feild' is a typo of 'field' — must be rejected.
+      awsSecretsManager: { arn: 'arn:x', feild: 'private_key' },
+    },
+  },
+}`
+	_, err := config.Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("expected typo in awsSecretsManager.feild to be rejected, got nil")
+	}
+	if !strings.Contains(err.Error(), "feild") && !strings.Contains(err.Error(), "unknown field") {
+		t.Errorf("error %q should name the unknown field", err.Error())
 	}
 }
 
