@@ -84,15 +84,45 @@ type Config struct {
 }
 
 // BrokerSignerConfig configures the broker's optional RSA
-// signing key and the JWKS endpoint that publishes its public
-// half.
+// signing keys and the JWKS endpoint that publishes their public
+// halves.
 type BrokerSignerConfig struct {
 	// PrivateKeySecret is the name of an entry in the top-level
 	// Secrets map whose resolved value is the PEM-encoded RSA
 	// private key the broker uses to sign its own JWTs. The
 	// public half is derived at startup and published via the
-	// JWKS endpoint.
-	PrivateKeySecret string `json:"privateKeySecret"`
+	// JWKS endpoint. Use PrivateKeySecrets instead when rotation
+	// overlap is needed; PrivateKeySecret is preserved as a
+	// single-key shortcut.
+	//
+	// Exactly one of PrivateKeySecret and PrivateKeySecrets
+	// must be set.
+	PrivateKeySecret string `json:"privateKeySecret,omitempty"`
+
+	// PrivateKeySecrets is the ordered list of named-secret
+	// entries holding the broker's signing keys. The first
+	// entry is the active signer (the key signjwt uses when
+	// minting new JWTs); every entry contributes one JWK to the
+	// published JWKS so downstream verifiers can validate JWTs
+	// signed with any of them. This shape exists to support
+	// zero-downtime key rotation:
+	//
+	//  1. Stage a new key under a new named secret.
+	//  2. Append the new secret to privateKeySecrets and
+	//     restart pods. JWKS now publishes both keys; broker
+	//     still signs with the first.
+	//  3. Wait the JWKS Cache-Control window (default 300s)
+	//     for downstream caches to re-fetch.
+	//  4. Reorder privateKeySecrets so the new key is first
+	//     and restart pods. Broker now signs with the new key;
+	//     the old key remains in the JWKS so any straggler JWT
+	//     signed during the change-over window still verifies.
+	//  5. Wait the cache window again, then drop the old
+	//     secret from privateKeySecrets and restart pods.
+	//
+	// Exactly one of PrivateKeySecret and PrivateKeySecrets
+	// must be set.
+	PrivateKeySecrets []string `json:"privateKeySecrets,omitempty"`
 
 	// Issuer, when non-empty, is the public URL the broker
 	// stamps into the iss claim of every JWT it signs and
@@ -104,6 +134,24 @@ type BrokerSignerConfig struct {
 	// discovery handler is not registered; the JWKS endpoint
 	// stays available unchanged.
 	Issuer string `json:"issuer,omitempty"`
+}
+
+// EffectiveSigningSecrets returns the ordered list of named-
+// secret references the broker should load and sign with. The
+// helper resolves the PrivateKeySecret / PrivateKeySecrets
+// either-or so callers do not have to branch on the single-vs-
+// list shape themselves.
+func (b *BrokerSignerConfig) EffectiveSigningSecrets() []string {
+	if b == nil {
+		return nil
+	}
+	if len(b.PrivateKeySecrets) > 0 {
+		return b.PrivateKeySecrets
+	}
+	if b.PrivateKeySecret != "" {
+		return []string{b.PrivateKeySecret}
+	}
+	return nil
 }
 
 // ServerConfig configures a single HTTP listener.
@@ -197,12 +245,21 @@ func (c *Config) Validate() error {
 		}
 	}
 	if c.BrokerSigner != nil {
-		if c.BrokerSigner.PrivateKeySecret == "" {
-			return fmt.Errorf("brokerSigner.privateKeySecret is required when brokerSigner is set")
+		single := c.BrokerSigner.PrivateKeySecret
+		list := c.BrokerSigner.PrivateKeySecrets
+		switch {
+		case single == "" && len(list) == 0:
+			return fmt.Errorf("brokerSigner: one of privateKeySecret or privateKeySecrets is required")
+		case single != "" && len(list) > 0:
+			return fmt.Errorf("brokerSigner: privateKeySecret and privateKeySecrets are mutually exclusive")
 		}
-		if _, ok := c.Secrets[c.BrokerSigner.PrivateKeySecret]; !ok {
-			return fmt.Errorf("brokerSigner.privateKeySecret %q does not name an entry in secrets",
-				c.BrokerSigner.PrivateKeySecret)
+		for i, name := range c.BrokerSigner.EffectiveSigningSecrets() {
+			if name == "" {
+				return fmt.Errorf("brokerSigner.privateKeySecrets[%d] is empty", i)
+			}
+			if _, ok := c.Secrets[name]; !ok {
+				return fmt.Errorf("brokerSigner: signing key %q does not name an entry in secrets", name)
+			}
 		}
 	}
 	return nil

@@ -160,7 +160,7 @@ func TestNew_EndToEndAgainstFakeUpstream(t *testing.T) {
 	var receivedSubjectToken string
 	var receivedForm url.Values
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = r.ParseForm()
+		_ = r.ParseForm() //nolint:gosec // G120: test server, body size already bounded by net/http defaults
 		receivedForm = r.PostForm
 		receivedSubjectToken = r.PostForm.Get("subject_token")
 		_, _ = w.Write([]byte(`{"access_token":"abc","expires_in":300}`))
@@ -298,12 +298,13 @@ func TestNew_OverridableSubjectTokenType(t *testing.T) {
 
 	var receivedType string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = r.ParseForm()
+		_ = r.ParseForm() //nolint:gosec // G120: test server, body size already bounded by net/http defaults
 		receivedType = r.PostForm.Get("subject_token_type")
 		_, _ = w.Write([]byte(`{"access_token":"x"}`))
 	}))
 	defer srv.Close()
 
+	//nolint:gosec // G101: subject_token_type URN is an IANA-registered identifier, not a credential
 	cfg := &oidctokenexchange.Config{
 		URL: srv.URL, ProviderName: "p",
 		SubjectTokenType: "urn:ietf:params:oauth:token-type:jwt",

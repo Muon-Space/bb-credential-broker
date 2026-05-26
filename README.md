@@ -354,12 +354,48 @@ against the claims you forward.
 
 #### Key rotation
 
-Single key, registered at startup. Rotation is a pod restart with
-the new key in place — same model the HMAC nonce-store signing
-key uses. The kid changes deterministically when the key changes,
-so downstream verifiers (which cache by kid) automatically
-re-fetch the JWKS the next time they see a JWT with an unknown
-kid.
+The `privateKeySecret` shape (single key) supports rotation by
+pod restart with the new key in place — same model the HMAC
+nonce-store signing key uses. The kid changes deterministically
+when the key changes, so downstream verifiers (which cache by
+kid) automatically re-fetch the JWKS the next time they see a
+JWT with an unknown kid. The trade-off is a window of up to the
+JWKS `Cache-Control: max-age` (default 300 seconds) during which
+downstream caches reject newly-signed JWTs.
+
+For zero-downtime rotation, use the `privateKeySecrets` list
+shape instead. The broker publishes every key in the JWKS while
+signing only with the first; operators rotate by reordering the
+list across two pod restarts:
+
+```jsonnet
+// Step 1: stage the new key as a second list entry, restart pods.
+// JWKS now publishes both keys; broker still signs with key-v1.
+brokerSigner: {
+  privateKeySecrets: ['broker-key-v1', 'broker-key-v2'],
+}
+
+// Step 2: wait the JWKS Cache-Control window (default 300s) for
+// downstream verifiers to re-fetch and learn the new key.
+
+// Step 3: reorder the list so the new key is first, restart pods.
+// Broker now signs with key-v2; key-v1 stays in the JWKS so any
+// straggler JWT signed during the change-over window still
+// verifies.
+brokerSigner: {
+  privateKeySecrets: ['broker-key-v2', 'broker-key-v1'],
+}
+
+// Step 4: wait the cache window again.
+
+// Step 5: drop the old key, restart pods. Single-key state.
+brokerSigner: {
+  privateKeySecrets: ['broker-key-v2'],
+}
+```
+
+`privateKeySecret` and `privateKeySecrets` are mutually exclusive
+— the broker rejects configurations that set both at load time.
 
 ### Body encoding gotcha
 

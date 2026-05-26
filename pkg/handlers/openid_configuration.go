@@ -54,11 +54,11 @@ func NewOpenIDConfigurationHandler(p OpenIDConfigurationParams) (*OpenIDConfigur
 		jwksURI = p.Issuer + "/.well-known/jwks.json"
 	}
 	doc := openIDConfigurationDocument{
-		Issuer:                            p.Issuer,
-		JWKSURI:                           jwksURI,
-		IDTokenSigningAlgValuesSupported:  []string{"RS256"},
-		ResponseTypesSupported:            []string{"token"},
-		SubjectTypesSupported:             []string{"public"},
+		Issuer:                           p.Issuer,
+		JWKSURI:                          jwksURI,
+		IDTokenSigningAlgValuesSupported: []string{"RS256"},
+		ResponseTypesSupported:           []string{"token"},
+		SubjectTypesSupported:            []string{"public"},
 	}
 	body, err := json.Marshal(doc)
 	if err != nil {

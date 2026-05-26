@@ -124,12 +124,16 @@ func New(ctx context.Context, cfg *config.Config) (*App, error) {
 		brokerJWKSPath: "/.well-known/jwks.json",
 	}
 	if cfg.BrokerSigner != nil {
-		ref, ok := cfg.Secrets[cfg.BrokerSigner.PrivateKeySecret]
-		if !ok {
-			return nil, fmt.Errorf("broker signer: secret %q is not configured",
-				cfg.BrokerSigner.PrivateKeySecret)
+		names := cfg.BrokerSigner.EffectiveSigningSecrets()
+		refs := make([]secrets.SecretRef, len(names))
+		for i, name := range names {
+			ref, ok := cfg.Secrets[name]
+			if !ok {
+				return nil, fmt.Errorf("broker signer: secret %q is not configured", name)
+			}
+			refs[i] = ref
 		}
-		s, err := signer.Load(ctx, loader, ref)
+		s, err := signer.LoadMulti(ctx, loader, refs)
 		if err != nil {
 			return nil, fmt.Errorf("broker signer: %w", err)
 		}

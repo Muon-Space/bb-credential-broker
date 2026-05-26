@@ -34,6 +34,8 @@ import (
 )
 
 // Default values that operators can omit from their configuration.
+//
+//nolint:gosec // G101: the subject_token_type URN is an IANA-registered identifier, not a credential
 const (
 	defaultAlgorithm        = "RS256"
 	defaultTTL              = "5m"

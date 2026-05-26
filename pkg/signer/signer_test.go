@@ -265,3 +265,107 @@ type erroringLoader struct{ err error }
 func (l *erroringLoader) Load(_ context.Context, _ secrets.SecretRef) ([]byte, error) {
 	return nil, l.err
 }
+
+// TestFromPEMs_MultiKey covers the rotation-overlap shape: a
+// Signer constructed from N keys must (a) publish every key in
+// the JWKS so downstream verifiers can validate any of them,
+// (b) name the first key as active so signjwt uses it for new
+// JWTs, and (c) preserve the operator-supplied order in the
+// JWKS body so an operator inspecting it can see which key is
+// active.
+func TestFromPEMs_MultiKey(t *testing.T) {
+	t.Parallel()
+	pemA, _ := generateRSAPEM(t)
+	pemB, _ := generateRSAPEM(t)
+	s, err := signer.FromPEMs([][]byte{pemA, pemB})
+	if err != nil {
+		t.Fatalf("FromPEMs: %v", err)
+	}
+
+	kids := s.KIDs()
+	if len(kids) != 2 {
+		t.Fatalf("KIDs length: got %d, want 2", len(kids))
+	}
+	if s.ActiveKID() != kids[0] {
+		t.Errorf("ActiveKID: got %q, want %q (first kid)", s.ActiveKID(), kids[0])
+	}
+
+	var parsed struct {
+		Keys []map[string]string `json:"keys"`
+	}
+	if err := json.Unmarshal(s.JWKSBytes(), &parsed); err != nil {
+		t.Fatalf("unmarshal jwks: %v", err)
+	}
+	if len(parsed.Keys) != 2 {
+		t.Fatalf("jwks keys length: got %d, want 2", len(parsed.Keys))
+	}
+	if parsed.Keys[0]["kid"] != kids[0] {
+		t.Errorf("jwks order: first key kid mismatch")
+	}
+	if parsed.Keys[1]["kid"] != kids[1] {
+		t.Errorf("jwks order: second key kid mismatch")
+	}
+}
+
+// TestFromPEMs_RejectsDuplicateKey pins the documented invariant
+// that rotation requires distinct keys. Catching a duplicate at
+// configuration load prevents a confusing JWKS where two
+// entries collide on kid (the downstream verifier would see a
+// single de-duplicated key).
+func TestFromPEMs_RejectsDuplicateKey(t *testing.T) {
+	t.Parallel()
+	pemA, _ := generateRSAPEM(t)
+	_, err := signer.FromPEMs([][]byte{pemA, pemA})
+	if err == nil {
+		t.Fatal("expected duplicate-kid error, got nil")
+	}
+	if !strings.Contains(err.Error(), "duplicate") {
+		t.Errorf("error %q should mention duplicate", err.Error())
+	}
+}
+
+// TestLoadMulti_PreservesRefOrder is the loader-path analogue of
+// TestFromPEMs_MultiKey: it confirms that the order of refs
+// supplied to LoadMulti is the order of keys the Signer holds
+// (the active key is refs[0]).
+func TestLoadMulti_PreservesRefOrder(t *testing.T) {
+	t.Parallel()
+	pemA, _ := generateRSAPEM(t)
+	pemB, _ := generateRSAPEM(t)
+	loader := secrets.NewMapLoader()
+	loader.Set("aws:arn:test:a#", pemA)
+	loader.Set("aws:arn:test:b#", pemB)
+
+	refs := []secrets.SecretRef{
+		{AWSSecretsManager: &secrets.AWSSecretsManagerRef{ARN: "arn:test:a"}},
+		{AWSSecretsManager: &secrets.AWSSecretsManagerRef{ARN: "arn:test:b"}},
+	}
+	s, err := signer.LoadMulti(context.Background(), loader, refs)
+	if err != nil {
+		t.Fatalf("LoadMulti: %v", err)
+	}
+	if len(s.KIDs()) != 2 {
+		t.Errorf("KIDs length: got %d, want 2", len(s.KIDs()))
+	}
+
+	// Sanity-check that swapping ref order swaps the active kid.
+	swapped, err := signer.LoadMulti(context.Background(), loader,
+		[]secrets.SecretRef{refs[1], refs[0]})
+	if err != nil {
+		t.Fatalf("LoadMulti (swapped): %v", err)
+	}
+	if swapped.ActiveKID() == s.ActiveKID() {
+		t.Errorf("expected swapped ref order to change the active kid")
+	}
+}
+
+// TestLoadMulti_EmptyRefs surfaces an operator misconfiguration
+// (an empty privateKeySecrets list) at the same point in the
+// boot path as every other signer error.
+func TestLoadMulti_EmptyRefs(t *testing.T) {
+	t.Parallel()
+	_, err := signer.LoadMulti(context.Background(), secrets.NewMapLoader(), nil)
+	if err == nil {
+		t.Fatal("expected error for empty refs, got nil")
+	}
+}
