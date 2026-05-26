@@ -97,9 +97,13 @@ func TestNew_ParsesTemplatesAtConstruction(t *testing.T) {
 
 func TestNew_ValidatesEveryBodyKind(t *testing.T) {
 	t.Parallel()
+	// body.json with templated leaf strings is rejected at
+	// configuration load (see TestNew_RejectsTemplatedValuesInBodyJSON);
+	// the body.json case here uses a non-templated payload to
+	// exercise the basic parse path without tripping that check.
 	for _, body := range []*httptokenexchange.BodyConfig{
 		{Form: map[string]string{"a": "${env:NONEXISTENT_OK}"}},
-		{JSON: json.RawMessage(`{"a":"${env:NONEXISTENT_OK}"}`)},
+		{JSON: json.RawMessage(`{"a":"static-value"}`)},
 		{Raw: "${env:NONEXISTENT_OK}"},
 	} {
 		cfg := &httptokenexchange.Config{
@@ -243,6 +247,78 @@ func TestNew_AcceptsAllBuiltinFunctions(t *testing.T) {
 	}
 	if _, err := httptokenexchange.New("x", cfg, newDeps()); err != nil {
 		t.Errorf("expected all built-ins to validate, got %v", err)
+	}
+}
+
+// TestNew_RejectsTemplatedValuesInBodyJSON pins the documented
+// invariant from the README "Body encoding gotcha" section: a
+// body.json whose leaf strings include ${...} expressions is
+// rejected at startup with an actionable error pointing the
+// operator at body.form or body.raw. Without the check the
+// template parser surfaces a misleading "unterminated argument"
+// at /token time when the JSON encoder's \" sequences confuse
+// the parser's string-literal tracking.
+func TestNew_RejectsTemplatedValuesInBodyJSON(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		json string
+		want string // expected substring in the error message
+	}{
+		{
+			name: "templated leaf in top-level object",
+			json: `{"sub":"${identity.principal}"}`,
+			want: "sub",
+		},
+		{
+			name: "templated leaf in nested object",
+			json: `{"outer":{"inner":"${now}"}}`,
+			want: "outer.inner",
+		},
+		{
+			name: "templated leaf inside an array element",
+			json: `{"items":["plain","${env:HOME}"]}`,
+			want: "items[1]",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := &httptokenexchange.Config{
+				Request: httptokenexchange.RequestConfig{
+					Method: "POST", URL: "https://example.com/",
+					Body: &httptokenexchange.BodyConfig{JSON: json.RawMessage(tc.json)},
+				},
+				Response: httptokenexchange.ResponseConfig{TokenJSONPath: "token"},
+			}
+			_, err := httptokenexchange.New("x", cfg, newDeps())
+			if err == nil {
+				t.Fatal("expected body.json template-value rejection, got nil")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q should mention the offending leaf path %q", err.Error(), tc.want)
+			}
+			if !strings.Contains(err.Error(), "body.form") {
+				t.Errorf("error %q should point operators at body.form / body.raw", err.Error())
+			}
+		})
+	}
+}
+
+// TestNew_AcceptsBodyJSONWithoutTemplates confirms the validator
+// does not false-positive on body.json that is genuinely
+// template-free.
+func TestNew_AcceptsBodyJSONWithoutTemplates(t *testing.T) {
+	t.Parallel()
+	cfg := &httptokenexchange.Config{
+		Request: httptokenexchange.RequestConfig{
+			Method: "POST", URL: "https://example.com/",
+			Body: &httptokenexchange.BodyConfig{JSON: json.RawMessage(`{"hardcoded":"value","n":42}`)},
+		},
+		Response: httptokenexchange.ResponseConfig{TokenJSONPath: "token"},
+	}
+	if _, err := httptokenexchange.New("x", cfg, newDeps()); err != nil {
+		t.Errorf("expected template-free body.json to pass, got %v", err)
 	}
 }
 

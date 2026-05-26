@@ -319,6 +319,32 @@ so downstream verifiers (which cache by kid) automatically
 re-fetch the JWKS the next time they see a JWT with an unknown
 kid.
 
+### Body encoding gotcha
+
+`body.json` is for non-templated JSON bodies only. The
+configuration loader rejects any `body.json` whose leaf strings
+contain `${...}` expressions at broker startup; the error points
+to the offending leaf path and recommends `body.form` or
+`body.raw` instead. The reason is subtle: the broker stores
+`body.json` as JSON-serialised bytes and runs the template parser
+across them, but the parser tracks string-literal nesting via an
+unescaped `"` toggle. A templated value whose evaluation contains
+a literal `"` becomes `\"` after JSON encoding, the first `\"`
+flips the parser into "inside string", every subsequent `\"`
+keeps it there, and the parser eventually surfaces an
+`unterminated argument` error far from the offending byte.
+
+The shapes that work for templated bodies:
+
+- **`body.form`** — each key/value pair is templated in isolation
+  and URL-encoded at request time. The canonical shape for
+  RFC 8693 token-exchange endpoints.
+- **`body.raw`** — one opaque templated payload. Combine with an
+  explicit `Content-Type` header. The recommended shape when the
+  body needs to be JSON-shaped: use `${json:...}` (see the
+  Templating table) to construct the JSON object, set
+  `Content-Type: application/json` in `request.headers`.
+
 ### Nonce store
 
 `/delegate` returns a delegation token whose validity is determined entirely

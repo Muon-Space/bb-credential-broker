@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/jmespath/go-jmespath"
@@ -84,6 +85,14 @@ type BodyConfig struct {
 	// are first templated as a string and the result must parse
 	// as valid JSON; the body is sent with Content-Type
 	// application/json.
+	//
+	// body.json is for non-templated JSON only. Configuration
+	// load rejects any body.json whose leaf strings contain
+	// ${...} expressions because the template parser cannot
+	// reliably tokenise across JSON-encoded \" sequences; the
+	// error points operators at body.form or body.raw with an
+	// explicit Content-Type instead. See README "Body encoding
+	// gotcha".
 	JSON json.RawMessage `json:"json,omitempty"`
 
 	// Raw, when set, is the body as an opaque string. Callers
@@ -318,6 +327,20 @@ func (i *Impl) parseBody(body *BodyConfig) error {
 			i.parsedForm = append(i.parsedForm, parsedHeader{key: kt, value: vt})
 		}
 	case body.JSON != nil:
+		// body.json is serialised JSON bytes that the template
+		// parser then walks. Any leaf string value containing a
+		// template expression (${...}) will have its surrounding
+		// quote characters JSON-escaped to \" — but the template
+		// parser's parseArg uses an unescaped " toggle to track
+		// string-literal nesting, so the first \" flips the
+		// nesting flag on and every subsequent \" keeps it on,
+		// producing an unterminated-argument error far from the
+		// actual offending byte. Detecting the shape here, at
+		// configuration load, surfaces an actionable error
+		// before any /token request exercises the destination.
+		if err := checkBodyJSONForTemplates(body.JSON); err != nil {
+			return err
+		}
 		t, err := template.Parse(string(body.JSON))
 		if err != nil {
 			return fmt.Errorf("request.body.json: %w", err)
@@ -331,6 +354,70 @@ func (i *Impl) parseBody(body *BodyConfig) error {
 		i.parsedRaw = t
 	}
 	return nil
+}
+
+// checkBodyJSONForTemplates returns an actionable error when any
+// leaf string in the operator-supplied body.json contains a
+// template expression. See parseBody for the underlying mechanic
+// (template parser confuses JSON-escaped \" for an unbalanced
+// string literal); operators landing here should switch the
+// destination to body.form (one value per key, each templated in
+// isolation) or body.raw (a single opaque templated payload they
+// own the Content-Type for).
+//
+// The check decodes the operator-supplied JSON into an any tree
+// once at startup and walks it recursively. Non-string leaves are
+// ignored. The cost is paid once per destination at boot.
+func checkBodyJSONForTemplates(body []byte) error {
+	var decoded any
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		// A non-JSON body.json fails the subsequent
+		// template.Parse anyway; don't double-report here.
+		return nil
+	}
+	if path := findTemplatedString(decoded, ""); path != "" {
+		return fmt.Errorf(
+			"request.body.json: leaf string at %s contains a template expression; "+
+				"body.json is incompatible with templated values that include literal '\"' "+
+				"after JSON encoding. Use request.body.form (each value templated in "+
+				"isolation) or request.body.raw (one opaque templated payload) instead",
+			path)
+	}
+	return nil
+}
+
+// findTemplatedString returns the dotted-path location of the first
+// leaf string value within v that contains a template expression,
+// or "" if none. Object keys and array indices form the path so
+// operator-facing errors localise the offending value.
+func findTemplatedString(v any, path string) string {
+	switch x := v.(type) {
+	case map[string]any:
+		for k, sub := range x {
+			leaf := path + "." + k
+			if path == "" {
+				leaf = k
+			}
+			if hit := findTemplatedString(sub, leaf); hit != "" {
+				return hit
+			}
+		}
+	case []any:
+		for i, sub := range x {
+			leaf := fmt.Sprintf("%s[%d]", path, i)
+			if hit := findTemplatedString(sub, leaf); hit != "" {
+				return hit
+			}
+		}
+	case string:
+		if strings.Contains(x, "${") {
+			if path == "" {
+				return "(root string)"
+			}
+			return path
+		}
+	}
+	return ""
 }
 
 // validateConfig performs the structural checks that don't require
