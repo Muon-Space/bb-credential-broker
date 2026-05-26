@@ -137,6 +137,146 @@ out of band on whatever cadence your threat model demands. The broker
 re-reads the file on every `Mint`, so the next dispense after rotation
 returns the new value with no broker restart.
 
+### Broker-signed JWTs
+
+Some destination services — JFrog's OAuth 2.0 token-exchange
+endpoint (`/access/api/v1/oidc/token`) is the motivating example —
+evaluate identity-mapping conditions only against the claims
+inside the JWT carried as `subject_token`. Any request-body
+extension that names additional claims for the mapping engine to
+consider is silently dropped, so an operator who needs the
+broker's `Identity` to drive scoping on the downstream side has
+to forward those claims **inside the signed token**, not alongside
+it.
+
+The broker supports this by minting an RS256-signed JWT inline in
+the destination's template, and by publishing the corresponding
+public key at `/.well-known/jwks.json` on the API listener so the
+downstream service can verify the signature.
+
+#### Configuring the broker
+
+Operators stage an RSA private key as a named secret and reference
+it from a new top-level `brokerSigner` block:
+
+```sh
+# Generate a 2048-bit RSA key.
+openssl genrsa -out broker-signing-key.pem 2048
+
+# Stage in AWS Secrets Manager (the broker's default loader
+# backend); operators using other backends register the key via
+# their existing mechanism.
+aws secretsmanager create-secret \
+  --name bb-credential-broker/signing-key \
+  --secret-string "$(jq -Rs '{private_key: .}' < broker-signing-key.pem)"
+```
+
+```jsonnet
+{
+  secrets: {
+    'broker-signing-key': {
+      awsSecretsManager: {
+        arn:   'arn:aws:secretsmanager:...:bb-credential-broker/signing-key',
+        field: 'private_key',
+      },
+    },
+  },
+  brokerSigner: {
+    privateKeySecret: 'broker-signing-key',
+  },
+}
+```
+
+When `brokerSigner` is present the broker registers a
+`GET /.well-known/jwks.json` handler on the API listener (the
+same listener `/delegate` and `/token` sit behind) returning a
+single-key JWKS:
+
+```json
+{
+  "keys": [
+    {
+      "kty": "RSA",
+      "use": "sig",
+      "alg": "RS256",
+      "kid": "<RFC 7638 JWK thumbprint of the public key>",
+      "n":   "<base64url modulus>",
+      "e":   "AQAB"
+    }
+  ]
+}
+```
+
+The endpoint is unauthenticated (a JSON Web Key Set is intended
+to be public) and is served with `Cache-Control: max-age=300` so
+downstream verifiers do not pound the API listener.
+
+#### Using the key from a destination template
+
+`${signjwt:RS256:${secret:NAME}:CLAIMS-JSON}` produces a compact
+JWT signed with the named key. The function always stamps the
+RFC 7638 JWK thumbprint of the public key into the `kid` header —
+deterministic from the key alone, matching what the JWKS endpoint
+publishes. Downstream verifiers resolve the right key without
+operator coordination:
+
+```jsonnet
+'token-exchange-via-broker-jwt': {
+  httpTokenExchange: {
+    request: {
+      method: 'POST',
+      url:    'https://destination.example.com/access/api/v1/oidc/token',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: { form: {
+        grant_type:         'urn:ietf:params:oauth:grant-type:token-exchange',
+        subject_token_type: 'urn:ietf:params:oauth:token-type:jwt',
+        subject_token: '${signjwt:RS256:${secret:broker-signing-key}:${json:{' +
+                       'iss:"https://broker.example.com",' +
+                       'sub:${jsonString:${identity.principal}},' +
+                       'iat:${now},' +
+                       'exp:${now+300s},' +
+                       'aud:"destination-token-exchange",' +
+                       'team:${jsonString:${default:${identity.claims.team}:unknown}}' +
+                       '}}}',
+        provider_name: 'bb-credential-broker',
+      } },
+    },
+    response: { tokenJsonPath: 'access_token', expiresInJsonPath: 'expires_in' },
+  },
+}
+```
+
+`examples/config.jsonnet` carries a worked end-to-end example
+under the `artifactory-prod` destination.
+
+#### Registering the broker as an OIDC provider downstream
+
+For a JFrog deployment the recipe is:
+
+1. **Manage Integrations → OIDC Integrations → New Integration**.
+   - Provider Type: `GenericOidc`.
+   - Issuer URL: the value the broker stamps into `iss` (must
+     match exactly).
+   - JWKS URL: `<broker-url>/.well-known/jwks.json`.
+   - Audience (if your JFrog version requires one): match the
+     `aud` your destination template embeds.
+2. Configure one or more **Identity Mappings** on the new
+   provider whose `Claims JSON` matches the claims your
+   destination template forwards.
+
+Other generic-OIDC consumers follow the same shape: point them at
+the broker's issuer URL and JWKS endpoint, configure mappings
+against the claims you forward.
+
+#### Key rotation
+
+Single key, registered at startup. Rotation is a pod restart with
+the new key in place — same model the HMAC nonce-store signing
+key uses. The kid changes deterministically when the key changes,
+so downstream verifiers (which cache by kid) automatically
+re-fetch the JWKS the next time they see a JWT with an unknown
+kid.
+
 ### Nonce store
 
 `/delegate` returns a delegation token whose validity is determined entirely

@@ -31,6 +31,7 @@ import (
 	brokermetrics "muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/metrics"
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/policy"
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/secrets"
+	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/signer"
 	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/store"
 )
 
@@ -38,21 +39,23 @@ import (
 // integration tests can wire bespoke dependencies without going
 // through the AWS-SDK code path.
 type App struct {
-	cfg           *config.Config
-	parser        *auth.Parser
-	policy        policy.Engine
-	store         store.NonceStore
-	registry      destinations.Registry
-	auditLogger   audit.Logger
-	metrics       *brokermetrics.Metrics
-	promRegistry  *prometheus.Registry
-	jwksRefresh   time.Duration
-	apiServer     *http.Server
-	diagServer    *http.Server
-	delegateRoute string
-	tokenRoute    string
-	healthzRoute  string
-	metricsRoute  string
+	cfg            *config.Config
+	parser         *auth.Parser
+	policy         policy.Engine
+	store          store.NonceStore
+	registry       destinations.Registry
+	auditLogger    audit.Logger
+	metrics        *brokermetrics.Metrics
+	promRegistry   *prometheus.Registry
+	jwksRefresh    time.Duration
+	brokerSigner   *signer.Signer
+	apiServer      *http.Server
+	diagServer     *http.Server
+	delegateRoute  string
+	tokenRoute     string
+	healthzRoute   string
+	metricsRoute   string
+	brokerJWKSPath string
 }
 
 // New constructs an App from a loaded configuration. AWS SDK
@@ -105,19 +108,32 @@ func New(ctx context.Context, cfg *config.Config) (*App, error) {
 	auditLogger := audit.NewStdoutLogger()
 
 	a := &App{
-		cfg:           cfg,
-		parser:        parser,
-		policy:        policyEngine,
-		store:         nonceStore,
-		registry:      registry,
-		auditLogger:   auditLogger,
-		metrics:       m,
-		promRegistry:  promRegistry,
-		jwksRefresh:   5 * time.Minute,
-		delegateRoute: "/delegate",
-		tokenRoute:    "/token",
-		healthzRoute:  "/-/healthy",
-		metricsRoute:  "/metrics",
+		cfg:            cfg,
+		parser:         parser,
+		policy:         policyEngine,
+		store:          nonceStore,
+		registry:       registry,
+		auditLogger:    auditLogger,
+		metrics:        m,
+		promRegistry:   promRegistry,
+		jwksRefresh:    5 * time.Minute,
+		delegateRoute:  "/delegate",
+		tokenRoute:     "/token",
+		healthzRoute:   "/-/healthy",
+		metricsRoute:   "/metrics",
+		brokerJWKSPath: "/.well-known/jwks.json",
+	}
+	if cfg.BrokerSigner != nil {
+		ref, ok := cfg.Secrets[cfg.BrokerSigner.PrivateKeySecret]
+		if !ok {
+			return nil, fmt.Errorf("broker signer: secret %q is not configured",
+				cfg.BrokerSigner.PrivateKeySecret)
+		}
+		s, err := signer.Load(ctx, loader, ref)
+		if err != nil {
+			return nil, fmt.Errorf("broker signer: %w", err)
+		}
+		a.brokerSigner = s
 	}
 	a.apiServer = a.buildAPIServer()
 	a.diagServer = a.buildDiagnosticsServer()
@@ -168,11 +184,17 @@ func (a *App) Serve(ctx context.Context) error {
 }
 
 // buildAPIServer constructs the HTTP server that serves /delegate
-// and /token on the API listener.
+// and /token on the API listener. When the broker is configured
+// with a signing key, /.well-known/jwks.json is registered on the
+// same listener so the operator's existing ingress reaches it
+// without further networking configuration.
 func (a *App) buildAPIServer() *http.Server {
 	mux := http.NewServeMux()
 	mux.Handle(a.delegateRoute, handlers.NewDelegateHandler(a.parser, a.policy, a.store, a.auditLogger, a.metrics))
 	mux.Handle(a.tokenRoute, handlers.NewTokenHandler(a.cfg.AllowedNets(), a.store, a.registry, a.auditLogger, a.metrics))
+	if a.brokerSigner != nil {
+		mux.Handle(a.brokerJWKSPath, handlers.NewJWKSHandler(a.brokerSigner.JWKSBytes()))
+	}
 	read, write := a.cfg.APIServer.HTTPServerTimeouts()
 	return &http.Server{
 		Addr:         a.cfg.APIServer.ListenAddress,

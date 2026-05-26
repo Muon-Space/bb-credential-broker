@@ -2,13 +2,8 @@ package template
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/ed25519"
-	"crypto/rsa"
-	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
 	"os"
 	"strconv"
@@ -16,6 +11,8 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+
+	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/signer"
 )
 
 // DefaultFuncs returns a fresh registry containing the built-in
@@ -226,6 +223,15 @@ func envFunc(_ context.Context, _ *Scope, args []string) (string, error) {
 //	            PKCS#1 and PKCS#8 RSA forms are accepted, as is
 //	            SEC1 EC and PKCS#8 EC.
 //	[2] claims  The JWT claim set, encoded as a JSON object.
+//
+// The signed JWT carries a kid header set to the RFC 7638 JWK
+// thumbprint of the public key. The thumbprint is deterministic
+// from the key alone, so downstream verifiers that look the
+// signing key up in a JSON Web Key Set (such as the broker's own
+// JWKS endpoint at /.well-known/jwks.json) can resolve the right
+// entry without operator coordination. Destinations whose
+// verifier ignores kid (a GitHub App installation token endpoint,
+// for example) are unaffected; the header is metadata only.
 func signJWTFunc(_ context.Context, _ *Scope, args []string) (string, error) {
 	if len(args) != 3 {
 		return "", fmt.Errorf("signjwt: expected 3 arguments, got %d", len(args))
@@ -237,9 +243,17 @@ func signJWTFunc(_ context.Context, _ *Scope, args []string) (string, error) {
 		return "", fmt.Errorf("signjwt: unsupported algorithm %q", alg)
 	}
 
-	key, err := parsePrivateKey([]byte(keyPEM))
+	key, err := signer.ParsePrivateKey([]byte(keyPEM))
 	if err != nil {
 		return "", fmt.Errorf("signjwt: parse key: %w", err)
+	}
+	pub, err := signer.PublicKey(key)
+	if err != nil {
+		return "", fmt.Errorf("signjwt: derive public key: %w", err)
+	}
+	kid, err := signer.Thumbprint(pub)
+	if err != nil {
+		return "", fmt.Errorf("signjwt: compute kid: %w", err)
 	}
 
 	var claims jwt.MapClaims
@@ -250,41 +264,12 @@ func signJWTFunc(_ context.Context, _ *Scope, args []string) (string, error) {
 	}
 
 	tok := jwt.NewWithClaims(method, claims)
+	tok.Header["kid"] = kid
 	signed, err := tok.SignedString(key)
 	if err != nil {
 		return "", fmt.Errorf("signjwt: sign: %w", err)
 	}
 	return signed, nil
-}
-
-// parsePrivateKey accepts a PEM-encoded private key in any of the
-// common forms used for JWT signing. The returned value is the
-// crypto-package private key type appropriate for the encoded
-// algorithm.
-func parsePrivateKey(pemBytes []byte) (any, error) {
-	block, _ := pem.Decode(pemBytes)
-	if block == nil {
-		return nil, fmt.Errorf("no PEM block found")
-	}
-	switch block.Type {
-	case "RSA PRIVATE KEY":
-		return x509.ParsePKCS1PrivateKey(block.Bytes)
-	case "EC PRIVATE KEY":
-		return x509.ParseECPrivateKey(block.Bytes)
-	case "PRIVATE KEY":
-		key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
-		if err != nil {
-			return nil, err
-		}
-		switch k := key.(type) {
-		case *rsa.PrivateKey, *ecdsa.PrivateKey, ed25519.PrivateKey:
-			return k, nil
-		default:
-			return nil, fmt.Errorf("PKCS#8 key has unsupported type %T", key)
-		}
-	default:
-		return nil, fmt.Errorf("unsupported PEM block type %q", block.Type)
-	}
 }
 
 // nowOffsetFunc handles the ${now+DUR} shorthand. The dispatcher in

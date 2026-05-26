@@ -68,6 +68,31 @@ type Config struct {
 	// Policy specifies which destinations each Identity may mint
 	// tokens for.
 	Policy policy.Config `json:"policy,omitempty"`
+
+	// BrokerSigner is the optional configuration for the broker's
+	// own RSA signing key and the JSON Web Key Set the broker
+	// publishes at /.well-known/jwks.json. The block is intended
+	// for deployments whose destinations rely on broker-minted
+	// JWTs as their subject_token — typically OAuth 2.0
+	// token-exchange endpoints whose downstream evaluates
+	// identity-mapping claims only against the JWT carried in
+	// subject_token and silently drops any request-body
+	// extension fields. When BrokerSigner is omitted the JWKS
+	// endpoint is not registered and the broker behaves exactly
+	// as it did before this feature shipped.
+	BrokerSigner *BrokerSignerConfig `json:"brokerSigner,omitempty"`
+}
+
+// BrokerSignerConfig configures the broker's optional RSA
+// signing key and the JWKS endpoint that publishes its public
+// half.
+type BrokerSignerConfig struct {
+	// PrivateKeySecret is the name of an entry in the top-level
+	// Secrets map whose resolved value is the PEM-encoded RSA
+	// private key the broker uses to sign its own JWTs. The
+	// public half is derived at startup and published via the
+	// JWKS endpoint.
+	PrivateKeySecret string `json:"privateKeySecret"`
 }
 
 // ServerConfig configures a single HTTP listener.
@@ -158,6 +183,15 @@ func (c *Config) Validate() error {
 	for name := range c.Destinations {
 		if name == "" {
 			return fmt.Errorf("destinations: empty destination name is not allowed")
+		}
+	}
+	if c.BrokerSigner != nil {
+		if c.BrokerSigner.PrivateKeySecret == "" {
+			return fmt.Errorf("brokerSigner.privateKeySecret is required when brokerSigner is set")
+		}
+		if _, ok := c.Secrets[c.BrokerSigner.PrivateKeySecret]; !ok {
+			return fmt.Errorf("brokerSigner.privateKeySecret %q does not name an entry in secrets",
+				c.BrokerSigner.PrivateKeySecret)
 		}
 	}
 	return nil
