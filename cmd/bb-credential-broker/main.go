@@ -5,14 +5,20 @@
 //
 //	bb-credential-broker <config.jsonnet>
 //	bb-credential-broker validate <config.jsonnet>
+//	bb-credential-broker render --identity FILE [--secret name=value ...] <config.jsonnet> <destination>
 //
 // The single-positional-argument form runs the broker against the
 // supplied configuration. The `validate` subcommand loads the same
 // configuration and runs every start-up validation path without
 // binding listeners, opening outbound connections, or starting
 // background goroutines; it exits 0 when the configuration is valid
-// and non-zero when it is not. Operators are expected to run the
-// validate subcommand in CI or as a terragrunt-plan precondition.
+// and non-zero when it is not. The `render` subcommand dry-runs a
+// destination against an operator-supplied fake identity and prints
+// the HTTP request the broker would dispatch, without actually
+// dispatching it; AWS credentials are not required because the
+// real secret loader is replaced with an in-memory map seeded from
+// --secret flags. Operators use `validate` in CI and `render` for
+// fast feedback iterating on destination templates.
 package main
 
 import (
@@ -58,6 +64,8 @@ func run(args []string, stderr io.Writer) int {
 			return 1
 		}
 		return 0
+	case "render":
+		return runRender(args[2:], stderr, os.Stdout)
 	default:
 		// Backwards-compatible single-argument form: the lone
 		// positional argument is the configuration path.
@@ -83,5 +91,7 @@ func run(args []string, stderr io.Writer) int {
 // validate path the first time they invoke the binary with no
 // arguments.
 func usage(w io.Writer, prog string) {
-	_, _ = fmt.Fprintf(w, "usage:\n  %s <config.jsonnet>\n  %s validate <config.jsonnet>\n", prog, prog)
+	_, _ = fmt.Fprintf(w,
+		"usage:\n  %s <config.jsonnet>\n  %s validate <config.jsonnet>\n  %s render --identity FILE [--secret name=value ...] <config.jsonnet> <destination>\n",
+		prog, prog, prog)
 }

@@ -397,11 +397,14 @@ make docker-run    # run the development image with examples/config.jsonnet
 
 ## Operating
 
-The broker has a single executable with two subcommand forms:
+The broker has a single executable with three subcommand forms:
 
 ```sh
-bb-credential-broker <config.jsonnet>            # run the broker
-bb-credential-broker validate <config.jsonnet>   # check configuration
+bb-credential-broker <config.jsonnet>                        # run the broker
+bb-credential-broker validate <config.jsonnet>               # check configuration
+bb-credential-broker render --identity FILE \                # dry-run a destination
+  [--secret name=value ...] [--output request|jwt|url] \
+  <config.jsonnet> <destination>
 ```
 
 The `validate` subcommand loads the configuration and runs every
@@ -417,6 +420,30 @@ Run it in CI as a gate on changes to the deployment's configuration
 inputs, or as a `terragrunt plan` precondition so misconfiguration
 is caught at PR review time rather than when the broker pod fails
 to start in cluster.
+
+The `render` subcommand prints the exact HTTP request the broker
+would dispatch for a given destination + identity pair, without
+actually dispatching it. Use it to iterate on destination templates
+locally instead of redeploying the broker and tailing audit logs.
+The real secret loader is replaced with an in-memory map seeded
+from `--secret name=value` flags, so AWS credentials are not
+required. The `--identity` flag points at a JSON file shaped like
+the broker's internal `Identity`:
+
+```json
+{
+  "type":      "ci",
+  "principal": "repo:owner/repo:ref:refs/heads/main",
+  "claims":    {"actor": "alice", "repository": "owner/repo"}
+}
+```
+
+`--output` defaults to `request` (curl-friendly representation of
+the full HTTP request); `--output jwt` decodes any `subject_token`
+form field as a JWT and prints its header and claims; `--output url`
+prints just the resolved URL. Destinations that mint locally (the
+`staticSecret` type) have no HTTP request to render and surface a
+friendly message instead.
 
 ## Releases
 

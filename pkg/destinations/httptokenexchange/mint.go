@@ -21,6 +21,29 @@ import (
 // keep an audit-log line workable.
 const upstreamExcerptBytes = 256
 
+// RenderRequest builds the outbound *http.Request the destination
+// would dispatch for identity, without dispatching it. The
+// `bb-credential-broker render` subcommand uses this to dry-run
+// destinations against a fake identity so operators can verify
+// the exact bytes the broker will send before deploying a
+// configuration change.
+//
+// Templates are evaluated in the same way Mint evaluates them
+// (same scope construction, same now-offset registration), but
+// the http.Client is never invoked. Errors propagate any
+// template or build failure the operator should see.
+func (i *Impl) RenderRequest(ctx context.Context, identity *auth.Identity) (*http.Request, error) {
+	scope := template.DefaultScope(identity, i.deps.Secrets, i.deps.NamedSecrets)
+	if err := i.registerNowOffsets(scope); err != nil {
+		return nil, fmt.Errorf("%s: register now offsets: %w", i.name, err)
+	}
+	req, err := i.buildRequest(ctx, scope)
+	if err != nil {
+		return nil, fmt.Errorf("%s: build request: %w", i.name, err)
+	}
+	return req, nil
+}
+
 // Mint executes the destination's templated HTTP exchange against
 // the upstream service and returns the resulting Token.
 //
