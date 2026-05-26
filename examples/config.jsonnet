@@ -102,6 +102,12 @@
   // coordination.
   brokerSigner: {
     privateKeySecret: 'broker-signing-key',
+    // Issuer is the public URL the broker stamps into the iss
+    // claim of every JWT it signs and advertises via
+    // /.well-known/openid-configuration. Set this so spec-
+    // compliant downstreams can auto-discover the JWKS endpoint
+    // rather than be configured per-field.
+    issuer: 'https://bb-credential-broker.example.com',
   },
 
   destinations: {

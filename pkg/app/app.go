@@ -187,13 +187,29 @@ func (a *App) Serve(ctx context.Context) error {
 // and /token on the API listener. When the broker is configured
 // with a signing key, /.well-known/jwks.json is registered on the
 // same listener so the operator's existing ingress reaches it
-// without further networking configuration.
+// without further networking configuration; if the operator also
+// supplies brokerSigner.issuer, /.well-known/openid-configuration
+// is registered too so spec-compliant downstreams can
+// auto-discover the JWKS rather than be configured per-field.
 func (a *App) buildAPIServer() *http.Server {
 	mux := http.NewServeMux()
 	mux.Handle(a.delegateRoute, handlers.NewDelegateHandler(a.parser, a.policy, a.store, a.auditLogger, a.metrics))
 	mux.Handle(a.tokenRoute, handlers.NewTokenHandler(a.cfg.AllowedNets(), a.store, a.registry, a.auditLogger, a.metrics))
 	if a.brokerSigner != nil {
 		mux.Handle(a.brokerJWKSPath, handlers.NewJWKSHandler(a.brokerSigner.JWKSBytes()))
+		if a.cfg.BrokerSigner != nil && a.cfg.BrokerSigner.Issuer != "" {
+			disc, err := handlers.NewOpenIDConfigurationHandler(handlers.OpenIDConfigurationParams{
+				Issuer:  a.cfg.BrokerSigner.Issuer,
+				JWKSURI: a.cfg.BrokerSigner.Issuer + a.brokerJWKSPath,
+			})
+			// Construction failure here is effectively impossible
+			// (the only failure path is json.Marshal of a tiny
+			// well-formed struct); log and proceed rather than
+			// turn a discovery-only feature into a boot failure.
+			if err == nil {
+				mux.Handle("/.well-known/openid-configuration", disc)
+			}
+		}
 	}
 	read, write := a.cfg.APIServer.HTTPServerTimeouts()
 	return &http.Server{

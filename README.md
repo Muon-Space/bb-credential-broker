@@ -183,6 +183,11 @@ aws secretsmanager create-secret \
   },
   brokerSigner: {
     privateKeySecret: 'broker-signing-key',
+    // Optional. When set, the broker also registers
+    // /.well-known/openid-configuration so spec-compliant
+    // downstreams (any GenericOidc consumer) auto-discover the
+    // JWKS endpoint instead of being configured per-field.
+    issuer: 'https://broker.example.com',
   },
 }
 ```
@@ -190,7 +195,10 @@ aws secretsmanager create-secret \
 When `brokerSigner` is present the broker registers a
 `GET /.well-known/jwks.json` handler on the API listener (the
 same listener `/delegate` and `/token` sit behind) returning a
-single-key JWKS:
+single-key JWKS. If `brokerSigner.issuer` is also set the broker
+registers `GET /.well-known/openid-configuration` returning a
+minimal OAuth 2.0 / OIDC discovery document so downstreams can
+auto-discover the JWKS URI. The JWKS body shape:
 
 ```json
 {

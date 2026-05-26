@@ -93,6 +93,17 @@ type BrokerSignerConfig struct {
 	// public half is derived at startup and published via the
 	// JWKS endpoint.
 	PrivateKeySecret string `json:"privateKeySecret"`
+
+	// Issuer, when non-empty, is the public URL the broker
+	// stamps into the iss claim of every JWT it signs and
+	// advertises in the OAuth 2.0 / OIDC discovery document
+	// served at /.well-known/openid-configuration. Spec-
+	// compliant downstreams (any GenericOidc consumer) can then
+	// auto-discover the broker's JWKS without operator-side
+	// per-field configuration. When Issuer is empty the
+	// discovery handler is not registered; the JWKS endpoint
+	// stays available unchanged.
+	Issuer string `json:"issuer,omitempty"`
 }
 
 // ServerConfig configures a single HTTP listener.
