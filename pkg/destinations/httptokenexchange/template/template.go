@@ -252,6 +252,29 @@ type parser struct {
 	pos   int
 }
 
+// errorf formats and returns a parser error tagged with the byte
+// offset the parser had reached when the error fired, plus a short
+// context window of the surrounding input. Operators bisecting a
+// long destination template have no other way to localise a failure
+// — the parser does not maintain a line/column counter — so the
+// offset + context together turn an opaque "argument: unterminated"
+// into something an operator can act on in seconds.
+func (p *parser) errorf(format string, args ...any) error {
+	msg := fmt.Sprintf(format, args...)
+	return fmt.Errorf("%s (offset %d; context %q)", msg, p.pos, p.contextSlice(20))
+}
+
+// contextSlice returns a slice of p.input centred on p.pos, capped
+// at radius bytes either side. The bounds clamp to the input rather
+// than panicking on an EOF-adjacent position so callers can use
+// contextSlice unconditionally regardless of where in the parse
+// they have reached.
+func (p *parser) contextSlice(radius int) string {
+	start := max(p.pos-radius, 0)
+	end := min(p.pos+radius, len(p.input))
+	return p.input[start:end]
+}
+
 // parseTemplate parses the entire input as a top-level template.
 // Brace nesting is tracked so that JSON literals like {"k":"v"} are
 // accepted as a literal whole, while a stray closing brace not
@@ -286,7 +309,7 @@ func (p *parser) parseTemplate(_ int) ([]chunk, error) {
 			braces++
 		case '}':
 			if braces == 0 {
-				return nil, fmt.Errorf("stray closing brace at offset %d", p.pos)
+				return nil, p.errorf("stray closing brace")
 			}
 			braces--
 		}
@@ -313,7 +336,7 @@ func (p *parser) parseExpr() (chunk, error) {
 	case ':':
 		return p.parseCall(name)
 	default:
-		return nil, fmt.Errorf("expression %q: unexpected separator %q", name, sep)
+		return nil, p.errorf("expression %q: unexpected separator %q", name, sep)
 	}
 }
 
@@ -326,7 +349,7 @@ func (p *parser) parseHead() (string, byte, error) {
 		ch := p.input[p.pos]
 		if ch == ':' || ch == '.' || ch == '}' {
 			if p.pos == start {
-				return "", 0, fmt.Errorf("expression at offset %d: empty function name", start)
+				return "", 0, p.errorf("expression: empty function name")
 			}
 			name := p.input[start:p.pos]
 			p.pos++
@@ -334,7 +357,7 @@ func (p *parser) parseHead() (string, byte, error) {
 		}
 		p.pos++
 	}
-	return "", 0, fmt.Errorf("expression at offset %d: unterminated", start)
+	return "", 0, p.errorf("expression starting at offset %d: unterminated", start)
 }
 
 // parseVarRef parses the rest of a variable-reference expression.
@@ -346,7 +369,7 @@ func (p *parser) parseVarRef(head string) (chunk, error) {
 	start := p.pos
 	for {
 		if p.pos >= len(p.input) {
-			return nil, fmt.Errorf("variable reference %q: unterminated", strings.Join(path, "."))
+			return nil, p.errorf("variable reference %q: unterminated", strings.Join(path, "."))
 		}
 		ch := p.input[p.pos]
 		if ch == '.' {
@@ -363,13 +386,13 @@ func (p *parser) parseVarRef(head string) (chunk, error) {
 		// Identifier characters: be liberal so that operators
 		// can use snake_case, dashes etc. inside claim names.
 		if ch == ':' {
-			return nil, fmt.Errorf("variable reference %q: unexpected ':' inside path", strings.Join(path, "."))
+			return nil, p.errorf("variable reference %q: unexpected ':' inside path", strings.Join(path, "."))
 		}
 		p.pos++
 	}
 	for _, c := range path {
 		if c == "" {
-			return nil, fmt.Errorf("variable reference: empty path component in %v", path)
+			return nil, p.errorf("variable reference: empty path component in %v", path)
 		}
 	}
 	return &varRef{path: path}, nil
@@ -393,7 +416,7 @@ func (p *parser) parseCall(name string) (chunk, error) {
 		case '}':
 			return &callExpr{name: name, args: args}, nil
 		default:
-			return nil, fmt.Errorf("function %s: argument terminated by %q", name, terminator)
+			return nil, p.errorf("function %s: argument terminated by %q", name, terminator)
 		}
 	}
 }
@@ -474,5 +497,5 @@ func (p *parser) parseArg() (*Template, byte, error) {
 		lit.WriteByte(ch)
 		p.pos++
 	}
-	return nil, 0, fmt.Errorf("argument: unterminated")
+	return nil, 0, p.errorf("argument: unterminated")
 }
