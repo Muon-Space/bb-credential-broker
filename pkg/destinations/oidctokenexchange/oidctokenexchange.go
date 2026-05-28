@@ -259,13 +259,13 @@ func buildSubjectTokenTemplate(sj *SignedJWTConfig, alg, ttl string) string {
 	// claims body is deterministic; user-supplied claims follow
 	// in lexicographic order.
 	jsonArgs := []string{
-		"iss", quotedJSONString(sj.Issuer),
-		"sub", sj.Subject,
+		"iss", jsonArgValue(sj.Issuer),
+		"sub", jsonArgValue(sj.Subject),
 		"iat", "${now}",
 		"exp", "${now+" + ttl + "}",
 	}
 	if sj.Audience != "" {
-		jsonArgs = append(jsonArgs, "aud", quotedJSONString(sj.Audience))
+		jsonArgs = append(jsonArgs, "aud", jsonArgValue(sj.Audience))
 	}
 	keys := make([]string, 0, len(sj.Claims))
 	for k := range sj.Claims {
@@ -273,20 +273,37 @@ func buildSubjectTokenTemplate(sj *SignedJWTConfig, alg, ttl string) string {
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		jsonArgs = append(jsonArgs, k, sj.Claims[k])
+		jsonArgs = append(jsonArgs, k, jsonArgValue(sj.Claims[k]))
 	}
 
 	jsonExpr := "${json:" + strings.Join(jsonArgs, ":") + "}"
 	return "${signjwt:" + alg + ":${secret:" + sj.SigningKey + "}:" + jsonExpr + "}"
 }
 
-// quotedJSONString wraps s as a JSON string literal so the
-// emitted form is what an operator would have hand-written for a
-// fixed string claim: with surrounding double quotes and proper
-// escaping. The ${json:...} function's auto-typing rule then
-// recognises the result as a valid JSON literal and passes it
-// through verbatim.
-func quotedJSONString(s string) string {
-	b, _ := json.Marshal(s)
+// jsonArgValue returns the form of v that should be passed as a
+// ${json:...} value argument:
+//
+//   - Pure literals (strings containing no ${...} substitution
+//     markers) are wrapped in JSON quotes so the literal can
+//     safely contain colons and other arg-separator characters.
+//     The canonical case is a fixed service-account subject like
+//     "system:serviceaccount:NAMESPACE:NAME" whose colons would
+//     otherwise be interpreted as ${json:...} arg separators and
+//     misalign the entire argument list.
+//   - Templated values pass through verbatim so their ${...}
+//     expressions are evaluated per request. The ${json:...}
+//     function's auto-typing rule then wraps the evaluated
+//     result as a JSON string at runtime.
+//
+// The heuristic is "contains ${"; it deliberately does not try
+// to parse the template at this layer. Mixed inputs like
+// "prefix-${identity.principal}" pass through and evaluate
+// correctly because ${json:...}'s auto-typer wraps the final
+// concatenated string at runtime.
+func jsonArgValue(v string) string {
+	if strings.Contains(v, "${") {
+		return v
+	}
+	b, _ := json.Marshal(v)
 	return string(b)
 }

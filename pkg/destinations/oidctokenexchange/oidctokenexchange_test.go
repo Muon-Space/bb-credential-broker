@@ -333,6 +333,177 @@ func TestNew_OverridableSubjectTokenType(t *testing.T) {
 	}
 }
 
+// TestNew_LiteralSubjectWithColonsIsAutoQuoted pins the
+// stakeholder-flagged regression: a fixed service-account
+// subject like "system:serviceaccount:NAMESPACE:NAME" contains
+// colons that would otherwise be interpreted as ${json:...} arg
+// separators and surface as "expected even number of arguments".
+// The transform auto-quotes pure-literal values so colons land
+// safely inside a JSON string.
+func TestNew_LiteralSubjectWithColonsIsAutoQuoted(t *testing.T) {
+	t.Parallel()
+	loader, priv := loaderWithKey(t, "broker-key")
+
+	var receivedSubjectToken string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm() //nolint:gosec // G120: test server, body size already bounded by net/http defaults
+		receivedSubjectToken = r.PostForm.Get("subject_token")
+		_, _ = w.Write([]byte(`{"access_token":"x"}`))
+	}))
+	defer srv.Close()
+
+	const literalSubject = "system:serviceaccount:bazel-cache:bb-credential-broker-sa"
+	cfg := &oidctokenexchange.Config{
+		URL:          srv.URL,
+		ProviderName: "p",
+		SubjectToken: oidctokenexchange.SubjectTokenConfig{
+			SignedJWT: &oidctokenexchange.SignedJWTConfig{
+				SigningKey: "broker-key",
+				Issuer:     "https://broker.example.com",
+				Subject:    literalSubject, // contains 3 colons
+			},
+		},
+		Response: httptokenexchange.ResponseConfig{TokenJSONPath: "access_token"},
+	}
+	deps := httptokenexchange.Dependencies{
+		Secrets: loader,
+		NamedSecrets: map[string]secrets.SecretRef{"broker-key": {
+			AWSSecretsManager: &secrets.AWSSecretsManagerRef{ARN: "arn:test:broker-key"},
+		}},
+	}
+	impl, err := oidctokenexchange.New("x", cfg, deps)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := impl.Mint(context.Background(), &auth.Identity{
+		Type: auth.IdentityTypeCI, Principal: "p",
+	}); err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+
+	parsed, err := jwt.Parse(receivedSubjectToken, func(*jwt.Token) (any, error) { return &priv.PublicKey, nil })
+	if err != nil {
+		t.Fatalf("parse jwt: %v", err)
+	}
+	claims, _ := parsed.Claims.(jwt.MapClaims)
+	if claims["sub"] != literalSubject {
+		t.Errorf("jwt sub: got %v, want %q (the literal value with colons preserved)", claims["sub"], literalSubject)
+	}
+}
+
+// TestNew_LiteralClaimWithColonsIsAutoQuoted covers the same
+// auto-quote rule for user-supplied claim VALUES. The previous
+// build emitted user claims raw and would split on colons in
+// the value.
+func TestNew_LiteralClaimWithColonsIsAutoQuoted(t *testing.T) {
+	t.Parallel()
+	loader, priv := loaderWithKey(t, "broker-key")
+
+	var receivedSubjectToken string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm() //nolint:gosec // G120: test server, body size already bounded by net/http defaults
+		receivedSubjectToken = r.PostForm.Get("subject_token")
+		_, _ = w.Write([]byte(`{"access_token":"x"}`))
+	}))
+	defer srv.Close()
+
+	cfg := &oidctokenexchange.Config{
+		URL:          srv.URL,
+		ProviderName: "p",
+		SubjectToken: oidctokenexchange.SubjectTokenConfig{
+			SignedJWT: &oidctokenexchange.SignedJWTConfig{
+				SigningKey: "broker-key",
+				Issuer:     "https://broker.example.com",
+				Subject:    "${identity.principal}",
+				Claims: map[string]string{
+					// A colon-bearing literal claim value.
+					"resource": "service:storage:read",
+				},
+			},
+		},
+		Response: httptokenexchange.ResponseConfig{TokenJSONPath: "access_token"},
+	}
+	deps := httptokenexchange.Dependencies{
+		Secrets: loader,
+		NamedSecrets: map[string]secrets.SecretRef{"broker-key": {
+			AWSSecretsManager: &secrets.AWSSecretsManagerRef{ARN: "arn:test:broker-key"},
+		}},
+	}
+	impl, err := oidctokenexchange.New("x", cfg, deps)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := impl.Mint(context.Background(), &auth.Identity{
+		Type: auth.IdentityTypeCI, Principal: "p",
+	}); err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+
+	parsed, err := jwt.Parse(receivedSubjectToken, func(*jwt.Token) (any, error) { return &priv.PublicKey, nil })
+	if err != nil {
+		t.Fatalf("parse jwt: %v", err)
+	}
+	claims, _ := parsed.Claims.(jwt.MapClaims)
+	if claims["resource"] != "service:storage:read" {
+		t.Errorf("jwt resource claim: got %v, want %q", claims["resource"], "service:storage:read")
+	}
+}
+
+// TestNew_TemplatedSubjectPassesThroughUnquoted confirms the
+// auto-quote rule fires only on pure literals. A templated value
+// like ${identity.principal} must pass through verbatim so its
+// substitution lands in the JWT claims at evaluation time.
+func TestNew_TemplatedSubjectPassesThroughUnquoted(t *testing.T) {
+	t.Parallel()
+	loader, priv := loaderWithKey(t, "broker-key")
+
+	var receivedSubjectToken string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm() //nolint:gosec // G120: test server, body size already bounded by net/http defaults
+		receivedSubjectToken = r.PostForm.Get("subject_token")
+		_, _ = w.Write([]byte(`{"access_token":"x"}`))
+	}))
+	defer srv.Close()
+
+	cfg := &oidctokenexchange.Config{
+		URL:          srv.URL,
+		ProviderName: "p",
+		SubjectToken: oidctokenexchange.SubjectTokenConfig{
+			SignedJWT: &oidctokenexchange.SignedJWTConfig{
+				SigningKey: "broker-key",
+				Issuer:     "https://broker.example.com",
+				Subject:    "${identity.principal}",
+			},
+		},
+		Response: httptokenexchange.ResponseConfig{TokenJSONPath: "access_token"},
+	}
+	deps := httptokenexchange.Dependencies{
+		Secrets: loader,
+		NamedSecrets: map[string]secrets.SecretRef{"broker-key": {
+			AWSSecretsManager: &secrets.AWSSecretsManagerRef{ARN: "arn:test:broker-key"},
+		}},
+	}
+	impl, err := oidctokenexchange.New("x", cfg, deps)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	identity := &auth.Identity{
+		Type:      auth.IdentityTypeCI,
+		Principal: "repo:owner/repo:ref:refs/heads/main",
+	}
+	if _, err := impl.Mint(context.Background(), identity); err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+	parsed, err := jwt.Parse(receivedSubjectToken, func(*jwt.Token) (any, error) { return &priv.PublicKey, nil })
+	if err != nil {
+		t.Fatalf("parse jwt: %v", err)
+	}
+	claims, _ := parsed.Claims.(jwt.MapClaims)
+	if claims["sub"] != identity.Principal {
+		t.Errorf("jwt sub: got %v, want %q (templated value should evaluate per request)", claims["sub"], identity.Principal)
+	}
+}
+
 // TestNew_DispatcherIntegration verifies the destinations registry
 // resolves the oidcTokenExchange discriminator end-to-end via JSON.
 func TestNew_DispatcherIntegration(t *testing.T) {
