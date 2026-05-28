@@ -40,6 +40,18 @@ const (
 	defaultAlgorithm        = "RS256"
 	defaultTTL              = "5m"
 	defaultSubjectTokenType = "urn:ietf:params:oauth:token-type:id_token"
+	defaultBodyFormat       = BodyFormatForm
+)
+
+// BodyFormat values for the destination's request body shape.
+// "form" is RFC 8693's canonical x-www-form-urlencoded payload
+// and the default. "json" emits the same fields as a JSON object
+// with Content-Type: application/json — required for downstreams
+// (Artifactory among them) that reject form-encoded bodies with
+// HTTP 415 Unsupported Media Type despite the spec.
+const (
+	BodyFormatForm = "form"
+	BodyFormatJSON = "json"
 )
 
 // Config is the configuration shape for a single named
@@ -68,6 +80,21 @@ type Config struct {
 	// most downstreams accept even though a broker-signed JWT is
 	// technically the generic JWT type per RFC 8693 §3.
 	SubjectTokenType string `json:"subjectTokenType,omitempty"`
+
+	// BodyFormat controls the wire format of the request body.
+	// Permitted values:
+	//
+	//   "form" — application/x-www-form-urlencoded (default;
+	//            RFC 8693's canonical shape).
+	//   "json" — application/json (required by Artifactory and
+	//            other downstreams that reject form-encoded
+	//            bodies with HTTP 415 Unsupported Media Type
+	//            despite the spec).
+	//
+	// Empty defaults to "form". The choice is downstream-
+	// specific; operators consult their target service's API
+	// documentation before adoption.
+	BodyFormat string `json:"bodyFormat,omitempty"`
 
 	// Response describes how the broker extracts the resulting
 	// access token from the downstream response. Passed through
@@ -192,6 +219,11 @@ func validateConfig(cfg *Config) error {
 	if alg := sj.Algorithm; alg != "" && alg != defaultAlgorithm {
 		return fmt.Errorf("subjectToken.signedJWT.algorithm: %q is not supported; broker advertises %s only", alg, defaultAlgorithm)
 	}
+	switch cfg.BodyFormat {
+	case "", BodyFormatForm, BodyFormatJSON:
+	default:
+		return fmt.Errorf("bodyFormat: %q is not supported; want %q or %q", cfg.BodyFormat, BodyFormatForm, BodyFormatJSON)
+	}
 	return nil
 }
 
@@ -199,10 +231,11 @@ func validateConfig(cfg *Config) error {
 // to the lower-level httpTokenExchange shape the existing
 // destination machinery already knows how to execute.
 //
-// The transform builds a form-encoded RFC 8693 request body and a
-// subject_token template that wraps the operator-supplied claims
-// in ${signjwt:RS256:${secret:KEY}:${json:...}}. Each claim
-// VALUE is passed verbatim to ${json:...}, which auto-types it at
+// The transform builds an RFC 8693 request body (form-encoded by
+// default, JSON when bodyFormat is "json") and a subject_token
+// template that wraps the operator-supplied claims in
+// ${signjwt:RS256:${secret:KEY}:${json:...}}. Each claim VALUE
+// is passed verbatim to ${json:...}, which auto-types it at
 // evaluation time (number-shaped templates land as JSON numbers,
 // string-shaped templates land as JSON-escaped strings).
 //
@@ -224,27 +257,67 @@ func (c *Config) toHTTPTokenExchange() (*httptokenexchange.Config, error) {
 	if subjectTokenType == "" {
 		subjectTokenType = defaultSubjectTokenType
 	}
+	bodyFormat := c.BodyFormat
+	if bodyFormat == "" {
+		bodyFormat = defaultBodyFormat
+	}
 
 	subjectToken := buildSubjectTokenTemplate(sj, alg, ttl)
 
+	headers, body := buildRequestBody(bodyFormat, c.ProviderName, subjectTokenType, subjectToken)
 	return &httptokenexchange.Config{
 		Request: httptokenexchange.RequestConfig{
-			Method: "POST",
-			URL:    c.URL,
-			Headers: map[string]string{
-				"Content-Type": "application/x-www-form-urlencoded",
-			},
-			Body: &httptokenexchange.BodyConfig{
-				Form: map[string]string{
-					"grant_type":         "urn:ietf:params:oauth:grant-type:token-exchange",
-					"subject_token_type": subjectTokenType,
-					"subject_token":      subjectToken,
-					"provider_name":      c.ProviderName,
-				},
-			},
+			Method:  "POST",
+			URL:     c.URL,
+			Headers: headers,
+			Body:    body,
 		},
 		Response: c.Response,
 	}, nil
+}
+
+// buildRequestBody returns the Content-Type header set and the
+// BodyConfig the destination should emit for the operator-chosen
+// body format. The same four logical fields (grant_type,
+// subject_token_type, subject_token, provider_name) are sent in
+// both shapes; only the wire encoding differs.
+//
+// The JSON path uses body.raw with ${json:...} wrapping rather
+// than body.json because the subject_token value contains the
+// nested ${signjwt:...:${json:...}} template — body.json's
+// footgun detector would correctly reject that pattern (the
+// signjwt arg includes literal " chars that would break the
+// template parser once JSON-encoded). body.raw skips the JSON
+// re-encoding step and feeds the operator-supplied bytes
+// through unchanged.
+func buildRequestBody(format, providerName, subjectTokenType, subjectToken string) (map[string]string, *httptokenexchange.BodyConfig) {
+	switch format {
+	case BodyFormatJSON:
+		headers := map[string]string{"Content-Type": "application/json"}
+		// Quote each fixed-string field (grant_type, provider_name,
+		// subject_token_type) and pass subject_token through
+		// verbatim; the ${json:...} call auto-types its values.
+		body := &httptokenexchange.BodyConfig{
+			Raw: "${json:" +
+				"grant_type:" + jsonArgValue("urn:ietf:params:oauth:grant-type:token-exchange") +
+				":subject_token_type:" + jsonArgValue(subjectTokenType) +
+				":subject_token:" + subjectToken +
+				":provider_name:" + jsonArgValue(providerName) +
+				"}",
+		}
+		return headers, body
+	default: // BodyFormatForm
+		headers := map[string]string{"Content-Type": "application/x-www-form-urlencoded"}
+		body := &httptokenexchange.BodyConfig{
+			Form: map[string]string{
+				"grant_type":         "urn:ietf:params:oauth:grant-type:token-exchange",
+				"subject_token_type": subjectTokenType,
+				"subject_token":      subjectToken,
+				"provider_name":      providerName,
+			},
+		}
+		return headers, body
+	}
 }
 
 // buildSubjectTokenTemplate assembles the ${signjwt:...:${json:...}}
@@ -259,13 +332,13 @@ func buildSubjectTokenTemplate(sj *SignedJWTConfig, alg, ttl string) string {
 	// claims body is deterministic; user-supplied claims follow
 	// in lexicographic order.
 	jsonArgs := []string{
-		"iss", quotedJSONString(sj.Issuer),
-		"sub", sj.Subject,
+		"iss", jsonArgValue(sj.Issuer),
+		"sub", jsonArgValue(sj.Subject),
 		"iat", "${now}",
 		"exp", "${now+" + ttl + "}",
 	}
 	if sj.Audience != "" {
-		jsonArgs = append(jsonArgs, "aud", quotedJSONString(sj.Audience))
+		jsonArgs = append(jsonArgs, "aud", jsonArgValue(sj.Audience))
 	}
 	keys := make([]string, 0, len(sj.Claims))
 	for k := range sj.Claims {
@@ -273,20 +346,37 @@ func buildSubjectTokenTemplate(sj *SignedJWTConfig, alg, ttl string) string {
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		jsonArgs = append(jsonArgs, k, sj.Claims[k])
+		jsonArgs = append(jsonArgs, k, jsonArgValue(sj.Claims[k]))
 	}
 
 	jsonExpr := "${json:" + strings.Join(jsonArgs, ":") + "}"
 	return "${signjwt:" + alg + ":${secret:" + sj.SigningKey + "}:" + jsonExpr + "}"
 }
 
-// quotedJSONString wraps s as a JSON string literal so the
-// emitted form is what an operator would have hand-written for a
-// fixed string claim: with surrounding double quotes and proper
-// escaping. The ${json:...} function's auto-typing rule then
-// recognises the result as a valid JSON literal and passes it
-// through verbatim.
-func quotedJSONString(s string) string {
-	b, _ := json.Marshal(s)
+// jsonArgValue returns the form of v that should be passed as a
+// ${json:...} value argument:
+//
+//   - Pure literals (strings containing no ${...} substitution
+//     markers) are wrapped in JSON quotes so the literal can
+//     safely contain colons and other arg-separator characters.
+//     The canonical case is a fixed service-account subject like
+//     "system:serviceaccount:NAMESPACE:NAME" whose colons would
+//     otherwise be interpreted as ${json:...} arg separators and
+//     misalign the entire argument list.
+//   - Templated values pass through verbatim so their ${...}
+//     expressions are evaluated per request. The ${json:...}
+//     function's auto-typing rule then wraps the evaluated
+//     result as a JSON string at runtime.
+//
+// The heuristic is "contains ${"; it deliberately does not try
+// to parse the template at this layer. Mixed inputs like
+// "prefix-${identity.principal}" pass through and evaluate
+// correctly because ${json:...}'s auto-typer wraps the final
+// concatenated string at runtime.
+func jsonArgValue(v string) string {
+	if strings.Contains(v, "${") {
+		return v
+	}
+	b, _ := json.Marshal(v)
 	return string(b)
 }

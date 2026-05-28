@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -330,6 +331,288 @@ func TestNew_OverridableSubjectTokenType(t *testing.T) {
 	}
 	if receivedType != "urn:ietf:params:oauth:token-type:jwt" {
 		t.Errorf("subject_token_type: got %q", receivedType)
+	}
+}
+
+// TestNew_BodyFormatJSON exercises the JSON body wire format.
+// Operators targeting Artifactory (which rejects form-encoded
+// with HTTP 415) opt into this path via bodyFormat: "json".
+// The destination must send the same four logical fields
+// (grant_type / subject_token_type / subject_token / provider_name)
+// as JSON, with Content-Type: application/json.
+func TestNew_BodyFormatJSON(t *testing.T) {
+	t.Parallel()
+	loader, priv := loaderWithKey(t, "broker-key")
+
+	var (
+		receivedCT     string
+		receivedBody   []byte
+		receivedDecode struct {
+			GrantType        string `json:"grant_type"`
+			SubjectTokenType string `json:"subject_token_type"`
+			SubjectToken     string `json:"subject_token"`
+			ProviderName     string `json:"provider_name"`
+		}
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedCT = r.Header.Get("Content-Type")
+		body, _ := io.ReadAll(r.Body)
+		receivedBody = body
+		_ = json.Unmarshal(body, &receivedDecode)
+		_, _ = w.Write([]byte(`{"access_token":"x"}`))
+	}))
+	defer srv.Close()
+
+	cfg := &oidctokenexchange.Config{
+		URL:          srv.URL,
+		ProviderName: "bb-credential-broker",
+		BodyFormat:   "json",
+		SubjectToken: oidctokenexchange.SubjectTokenConfig{
+			SignedJWT: &oidctokenexchange.SignedJWTConfig{
+				SigningKey: "broker-key",
+				Issuer:     "https://broker.example.com",
+				Subject:    "${identity.principal}",
+				Audience:   "downstream-tx",
+			},
+		},
+		Response: httptokenexchange.ResponseConfig{TokenJSONPath: "access_token"},
+	}
+	deps := httptokenexchange.Dependencies{
+		Secrets: loader,
+		NamedSecrets: map[string]secrets.SecretRef{"broker-key": {
+			AWSSecretsManager: &secrets.AWSSecretsManagerRef{ARN: "arn:test:broker-key"},
+		}},
+	}
+	impl, err := oidctokenexchange.New("x", cfg, deps)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := impl.Mint(context.Background(), &auth.Identity{
+		Type:      auth.IdentityTypeCI,
+		Principal: "repo:owner/repo",
+	}); err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+
+	if receivedCT != "application/json" {
+		t.Errorf("Content-Type: got %q, want application/json", receivedCT)
+	}
+	if !json.Valid(receivedBody) {
+		t.Errorf("body is not valid JSON: %s", string(receivedBody))
+	}
+	if receivedDecode.GrantType != "urn:ietf:params:oauth:grant-type:token-exchange" {
+		t.Errorf("grant_type: got %q", receivedDecode.GrantType)
+	}
+	if receivedDecode.SubjectTokenType != "urn:ietf:params:oauth:token-type:id_token" {
+		t.Errorf("subject_token_type: got %q", receivedDecode.SubjectTokenType)
+	}
+	if receivedDecode.ProviderName != "bb-credential-broker" {
+		t.Errorf("provider_name: got %q", receivedDecode.ProviderName)
+	}
+	parsed, err := jwt.Parse(receivedDecode.SubjectToken, func(*jwt.Token) (any, error) { return &priv.PublicKey, nil })
+	if err != nil {
+		t.Fatalf("subject_token jwt parse: %v", err)
+	}
+	if claims, _ := parsed.Claims.(jwt.MapClaims); claims["sub"] != "repo:owner/repo" {
+		t.Errorf("sub claim: got %v", claims["sub"])
+	}
+}
+
+// TestNew_RejectsInvalidBodyFormat catches operator typos in the
+// new field at configuration load.
+func TestNew_RejectsInvalidBodyFormat(t *testing.T) {
+	t.Parallel()
+	loader, _ := loaderWithKey(t, "k")
+	cfg := &oidctokenexchange.Config{
+		URL: "https://x", ProviderName: "p",
+		BodyFormat: "frog",
+		SubjectToken: oidctokenexchange.SubjectTokenConfig{
+			SignedJWT: &oidctokenexchange.SignedJWTConfig{SigningKey: "k", Issuer: "iss", Subject: "sub"},
+		},
+		Response: httptokenexchange.ResponseConfig{TokenJSONPath: "access_token"},
+	}
+	_, err := oidctokenexchange.New("x", cfg, httptokenexchange.Dependencies{
+		Secrets: loader,
+		NamedSecrets: map[string]secrets.SecretRef{"k": {
+			AWSSecretsManager: &secrets.AWSSecretsManagerRef{ARN: "arn:test:k"},
+		}},
+	})
+	if err == nil {
+		t.Fatal("expected error for invalid bodyFormat, got nil")
+	}
+	if !strings.Contains(err.Error(), "bodyFormat") {
+		t.Errorf("error %q should mention bodyFormat", err.Error())
+	}
+}
+
+// TestNew_LiteralSubjectWithColonsIsAutoQuoted pins the
+// stakeholder-flagged regression: a fixed service-account
+// subject like "system:serviceaccount:NAMESPACE:NAME" contains
+// colons that would otherwise be interpreted as ${json:...} arg
+// separators and surface as "expected even number of arguments".
+// The transform auto-quotes pure-literal values so colons land
+// safely inside a JSON string.
+func TestNew_LiteralSubjectWithColonsIsAutoQuoted(t *testing.T) {
+	t.Parallel()
+	loader, priv := loaderWithKey(t, "broker-key")
+
+	var receivedSubjectToken string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm() //nolint:gosec // G120: test server, body size already bounded by net/http defaults
+		receivedSubjectToken = r.PostForm.Get("subject_token")
+		_, _ = w.Write([]byte(`{"access_token":"x"}`))
+	}))
+	defer srv.Close()
+
+	const literalSubject = "system:serviceaccount:bazel-cache:bb-credential-broker-sa"
+	cfg := &oidctokenexchange.Config{
+		URL:          srv.URL,
+		ProviderName: "p",
+		SubjectToken: oidctokenexchange.SubjectTokenConfig{
+			SignedJWT: &oidctokenexchange.SignedJWTConfig{
+				SigningKey: "broker-key",
+				Issuer:     "https://broker.example.com",
+				Subject:    literalSubject, // contains 3 colons
+			},
+		},
+		Response: httptokenexchange.ResponseConfig{TokenJSONPath: "access_token"},
+	}
+	deps := httptokenexchange.Dependencies{
+		Secrets: loader,
+		NamedSecrets: map[string]secrets.SecretRef{"broker-key": {
+			AWSSecretsManager: &secrets.AWSSecretsManagerRef{ARN: "arn:test:broker-key"},
+		}},
+	}
+	impl, err := oidctokenexchange.New("x", cfg, deps)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := impl.Mint(context.Background(), &auth.Identity{
+		Type: auth.IdentityTypeCI, Principal: "p",
+	}); err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+
+	parsed, err := jwt.Parse(receivedSubjectToken, func(*jwt.Token) (any, error) { return &priv.PublicKey, nil })
+	if err != nil {
+		t.Fatalf("parse jwt: %v", err)
+	}
+	claims, _ := parsed.Claims.(jwt.MapClaims)
+	if claims["sub"] != literalSubject {
+		t.Errorf("jwt sub: got %v, want %q (the literal value with colons preserved)", claims["sub"], literalSubject)
+	}
+}
+
+// TestNew_LiteralClaimWithColonsIsAutoQuoted covers the same
+// auto-quote rule for user-supplied claim VALUES. The previous
+// build emitted user claims raw and would split on colons in
+// the value.
+func TestNew_LiteralClaimWithColonsIsAutoQuoted(t *testing.T) {
+	t.Parallel()
+	loader, priv := loaderWithKey(t, "broker-key")
+
+	var receivedSubjectToken string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm() //nolint:gosec // G120: test server, body size already bounded by net/http defaults
+		receivedSubjectToken = r.PostForm.Get("subject_token")
+		_, _ = w.Write([]byte(`{"access_token":"x"}`))
+	}))
+	defer srv.Close()
+
+	cfg := &oidctokenexchange.Config{
+		URL:          srv.URL,
+		ProviderName: "p",
+		SubjectToken: oidctokenexchange.SubjectTokenConfig{
+			SignedJWT: &oidctokenexchange.SignedJWTConfig{
+				SigningKey: "broker-key",
+				Issuer:     "https://broker.example.com",
+				Subject:    "${identity.principal}",
+				Claims: map[string]string{
+					// A colon-bearing literal claim value.
+					"resource": "service:storage:read",
+				},
+			},
+		},
+		Response: httptokenexchange.ResponseConfig{TokenJSONPath: "access_token"},
+	}
+	deps := httptokenexchange.Dependencies{
+		Secrets: loader,
+		NamedSecrets: map[string]secrets.SecretRef{"broker-key": {
+			AWSSecretsManager: &secrets.AWSSecretsManagerRef{ARN: "arn:test:broker-key"},
+		}},
+	}
+	impl, err := oidctokenexchange.New("x", cfg, deps)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := impl.Mint(context.Background(), &auth.Identity{
+		Type: auth.IdentityTypeCI, Principal: "p",
+	}); err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+
+	parsed, err := jwt.Parse(receivedSubjectToken, func(*jwt.Token) (any, error) { return &priv.PublicKey, nil })
+	if err != nil {
+		t.Fatalf("parse jwt: %v", err)
+	}
+	claims, _ := parsed.Claims.(jwt.MapClaims)
+	if claims["resource"] != "service:storage:read" {
+		t.Errorf("jwt resource claim: got %v, want %q", claims["resource"], "service:storage:read")
+	}
+}
+
+// TestNew_TemplatedSubjectPassesThroughUnquoted confirms the
+// auto-quote rule fires only on pure literals. A templated value
+// like ${identity.principal} must pass through verbatim so its
+// substitution lands in the JWT claims at evaluation time.
+func TestNew_TemplatedSubjectPassesThroughUnquoted(t *testing.T) {
+	t.Parallel()
+	loader, priv := loaderWithKey(t, "broker-key")
+
+	var receivedSubjectToken string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm() //nolint:gosec // G120: test server, body size already bounded by net/http defaults
+		receivedSubjectToken = r.PostForm.Get("subject_token")
+		_, _ = w.Write([]byte(`{"access_token":"x"}`))
+	}))
+	defer srv.Close()
+
+	cfg := &oidctokenexchange.Config{
+		URL:          srv.URL,
+		ProviderName: "p",
+		SubjectToken: oidctokenexchange.SubjectTokenConfig{
+			SignedJWT: &oidctokenexchange.SignedJWTConfig{
+				SigningKey: "broker-key",
+				Issuer:     "https://broker.example.com",
+				Subject:    "${identity.principal}",
+			},
+		},
+		Response: httptokenexchange.ResponseConfig{TokenJSONPath: "access_token"},
+	}
+	deps := httptokenexchange.Dependencies{
+		Secrets: loader,
+		NamedSecrets: map[string]secrets.SecretRef{"broker-key": {
+			AWSSecretsManager: &secrets.AWSSecretsManagerRef{ARN: "arn:test:broker-key"},
+		}},
+	}
+	impl, err := oidctokenexchange.New("x", cfg, deps)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	identity := &auth.Identity{
+		Type:      auth.IdentityTypeCI,
+		Principal: "repo:owner/repo:ref:refs/heads/main",
+	}
+	if _, err := impl.Mint(context.Background(), identity); err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+	parsed, err := jwt.Parse(receivedSubjectToken, func(*jwt.Token) (any, error) { return &priv.PublicKey, nil })
+	if err != nil {
+		t.Fatalf("parse jwt: %v", err)
+	}
+	claims, _ := parsed.Claims.(jwt.MapClaims)
+	if claims["sub"] != identity.Principal {
+		t.Errorf("jwt sub: got %v, want %q (templated value should evaluate per request)", claims["sub"], identity.Principal)
 	}
 }
 

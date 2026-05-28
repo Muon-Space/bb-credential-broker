@@ -130,6 +130,14 @@
       oidcTokenExchange: {
         url:          'https://artifactory.example.com/access/api/v1/oidc/token',
         providerName: 'bb-credential-broker',
+        // Artifactory's /access/api/v1/oidc/token rejects
+        // application/x-www-form-urlencoded with HTTP 415
+        // UNSUPPORTED_MEDIA_TYPE despite RFC 8693 specifying it
+        // as the canonical wire format; bodyFormat must be set
+        // to 'json' for this downstream. Other RFC 8693
+        // consumers (Vault, Auth0, generic OIDC) take the
+        // default 'form'.
+        bodyFormat: 'json',
         // subjectTokenType is omitted here so the broker uses the
         // default 'urn:ietf:params:oauth:token-type:id_token'.
         // RFC 8693 §3 defines both that value and
