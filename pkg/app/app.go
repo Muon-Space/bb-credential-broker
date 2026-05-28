@@ -133,7 +133,7 @@ func New(ctx context.Context, cfg *config.Config) (*App, error) {
 			}
 			refs[i] = ref
 		}
-		s, err := signer.LoadMulti(ctx, loader, refs)
+		s, err := loadBrokerSigner(ctx, loader, refs)
 		if err != nil {
 			return nil, fmt.Errorf("broker signer: %w", err)
 		}
