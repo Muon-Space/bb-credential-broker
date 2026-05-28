@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -330,6 +331,117 @@ func TestNew_OverridableSubjectTokenType(t *testing.T) {
 	}
 	if receivedType != "urn:ietf:params:oauth:token-type:jwt" {
 		t.Errorf("subject_token_type: got %q", receivedType)
+	}
+}
+
+// TestNew_BodyFormatJSON exercises the JSON body wire format.
+// Operators targeting Artifactory (which rejects form-encoded
+// with HTTP 415) opt into this path via bodyFormat: "json".
+// The destination must send the same four logical fields
+// (grant_type / subject_token_type / subject_token / provider_name)
+// as JSON, with Content-Type: application/json.
+func TestNew_BodyFormatJSON(t *testing.T) {
+	t.Parallel()
+	loader, priv := loaderWithKey(t, "broker-key")
+
+	var (
+		receivedCT     string
+		receivedBody   []byte
+		receivedDecode struct {
+			GrantType        string `json:"grant_type"`
+			SubjectTokenType string `json:"subject_token_type"`
+			SubjectToken     string `json:"subject_token"`
+			ProviderName     string `json:"provider_name"`
+		}
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedCT = r.Header.Get("Content-Type")
+		body, _ := io.ReadAll(r.Body)
+		receivedBody = body
+		_ = json.Unmarshal(body, &receivedDecode)
+		_, _ = w.Write([]byte(`{"access_token":"x"}`))
+	}))
+	defer srv.Close()
+
+	cfg := &oidctokenexchange.Config{
+		URL:          srv.URL,
+		ProviderName: "bb-credential-broker",
+		BodyFormat:   "json",
+		SubjectToken: oidctokenexchange.SubjectTokenConfig{
+			SignedJWT: &oidctokenexchange.SignedJWTConfig{
+				SigningKey: "broker-key",
+				Issuer:     "https://broker.example.com",
+				Subject:    "${identity.principal}",
+				Audience:   "downstream-tx",
+			},
+		},
+		Response: httptokenexchange.ResponseConfig{TokenJSONPath: "access_token"},
+	}
+	deps := httptokenexchange.Dependencies{
+		Secrets: loader,
+		NamedSecrets: map[string]secrets.SecretRef{"broker-key": {
+			AWSSecretsManager: &secrets.AWSSecretsManagerRef{ARN: "arn:test:broker-key"},
+		}},
+	}
+	impl, err := oidctokenexchange.New("x", cfg, deps)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := impl.Mint(context.Background(), &auth.Identity{
+		Type:      auth.IdentityTypeCI,
+		Principal: "repo:owner/repo",
+	}); err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+
+	if receivedCT != "application/json" {
+		t.Errorf("Content-Type: got %q, want application/json", receivedCT)
+	}
+	if !json.Valid(receivedBody) {
+		t.Errorf("body is not valid JSON: %s", string(receivedBody))
+	}
+	if receivedDecode.GrantType != "urn:ietf:params:oauth:grant-type:token-exchange" {
+		t.Errorf("grant_type: got %q", receivedDecode.GrantType)
+	}
+	if receivedDecode.SubjectTokenType != "urn:ietf:params:oauth:token-type:id_token" {
+		t.Errorf("subject_token_type: got %q", receivedDecode.SubjectTokenType)
+	}
+	if receivedDecode.ProviderName != "bb-credential-broker" {
+		t.Errorf("provider_name: got %q", receivedDecode.ProviderName)
+	}
+	parsed, err := jwt.Parse(receivedDecode.SubjectToken, func(*jwt.Token) (any, error) { return &priv.PublicKey, nil })
+	if err != nil {
+		t.Fatalf("subject_token jwt parse: %v", err)
+	}
+	if claims, _ := parsed.Claims.(jwt.MapClaims); claims["sub"] != "repo:owner/repo" {
+		t.Errorf("sub claim: got %v", claims["sub"])
+	}
+}
+
+// TestNew_RejectsInvalidBodyFormat catches operator typos in the
+// new field at configuration load.
+func TestNew_RejectsInvalidBodyFormat(t *testing.T) {
+	t.Parallel()
+	loader, _ := loaderWithKey(t, "k")
+	cfg := &oidctokenexchange.Config{
+		URL: "https://x", ProviderName: "p",
+		BodyFormat: "frog",
+		SubjectToken: oidctokenexchange.SubjectTokenConfig{
+			SignedJWT: &oidctokenexchange.SignedJWTConfig{SigningKey: "k", Issuer: "iss", Subject: "sub"},
+		},
+		Response: httptokenexchange.ResponseConfig{TokenJSONPath: "access_token"},
+	}
+	_, err := oidctokenexchange.New("x", cfg, httptokenexchange.Dependencies{
+		Secrets: loader,
+		NamedSecrets: map[string]secrets.SecretRef{"k": {
+			AWSSecretsManager: &secrets.AWSSecretsManagerRef{ARN: "arn:test:k"},
+		}},
+	})
+	if err == nil {
+		t.Fatal("expected error for invalid bodyFormat, got nil")
+	}
+	if !strings.Contains(err.Error(), "bodyFormat") {
+		t.Errorf("error %q should mention bodyFormat", err.Error())
 	}
 }
 

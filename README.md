@@ -294,10 +294,10 @@ under the `artifactory-prod` destination.
 #### Higher-level destination type for the common case
 
 For destinations that follow the canonical pattern — an RFC 8693
-token-exchange endpoint, broker-signed JWT as `subject_token`,
-form-encoded body — the `oidcTokenExchange` destination type
-packages the boilerplate into a type-safe block. Operators write
-only the fields downstream identity mappings actually look at:
+token-exchange endpoint, broker-signed JWT as `subject_token` —
+the `oidcTokenExchange` destination type packages the boilerplate
+into a type-safe block. Operators write only the fields
+downstream identity mappings actually look at:
 
 ```jsonnet
 'token-exchange': {
@@ -322,16 +322,25 @@ only the fields downstream identity mappings actually look at:
 ```
 
 The broker compiles this down to an equivalent `httpTokenExchange`
-config at start-up: the form body is assembled correctly, the
+config at start-up: the request body is assembled correctly, the
 `subject_token` is constructed via `signjwt` + `json` with the
 right `iat` / `exp` / `kid`, and the response shape passes
 through verbatim. Bug fixes and feature additions to
 `httpTokenExchange` benefit both types because there is only one
 HTTP code path.
 
+`bodyFormat` defaults to `form` (RFC 8693's canonical
+`application/x-www-form-urlencoded` payload). Some downstreams
+— notably **Artifactory's `/access/api/v1/oidc/token`** — reject
+form-encoded with HTTP 415 Unsupported Media Type and require
+JSON. Set `bodyFormat: 'json'` on those destinations; the broker
+sends the same four logical fields (`grant_type`,
+`subject_token_type`, `subject_token`, `provider_name`) as a
+JSON object with `Content-Type: application/json`.
+
 Drop down to `httpTokenExchange` directly for destinations whose
-request shape needs custom headers, non-form bodies, or anything
-else the higher-level type does not cover.
+request shape needs custom headers, an unusual content type, or
+anything else the higher-level type does not cover.
 
 #### Registering the broker as an OIDC provider downstream
 
