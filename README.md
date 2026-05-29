@@ -11,7 +11,7 @@ and `bb-worker` inside the same Kubernetes namespace.
 
 ## How it works
 
-Two endpoints, both speaking JSON over HTTP:
+Two credential endpoints, both speaking JSON over HTTP:
 
 - `POST /delegate` — exposed externally; authenticated by bearer JWT.
   Validates the caller's JWT against the configured set of issuers, resolves
@@ -23,8 +23,13 @@ Two endpoints, both speaking JSON over HTTP:
 - `POST /token` — exposed only inside the cluster; further restricted to a
   set of source CIDRs as defense-in-depth. Accepts a delegation token
   together with the name of a destination, validates the token against the
-  broker's signing key, dispatches to the named destination's mint flow,
-  and returns the freshly minted credential.
+  broker's signing key, confirms the destination is within the token's
+  granted set, dispatches to the named destination's mint flow, and
+  returns the freshly minted credential.
+
+The [`egress-authd`](#egress-authd-sidecar) sidecar consumes `/token`
+directly (relaying an action's delegation grant); it adds no broker-side
+endpoint.
 
 The broker has no compiled-in knowledge of any particular destination
 service. It ships two generic destination types parameterised entirely
@@ -484,14 +489,190 @@ the minimum recommended for HS256 by RFC 7518 §3.2. Key rotation is a pod
 restart with the new key in place; this release does not implement kid-based
 key sets.
 
+## egress-authd sidecar
+
+`egress-authd` (`cmd/egress-authd`) is a companion binary that runs as a
+sidecar next to a `bb-worker` container. It transparently authenticates an
+action's outbound HTTP(S) traffic by exchanging the action's broker
+delegation grant for per-destination credentials at the broker's existing
+[`/token`](#how-it-works) endpoint, so build tooling (pip, cargo, git,
+curl) reaches private registries without any per-tool credential
+configuration baked into the action. It adds **no** broker-side endpoint.
+
+The worker first obtains a delegation grant at `/delegate`, scoped to the
+set of destinations the action may reach. It then passes that **grant**
+to the sidecar; the sidecar relays it to `/token` per destination.
+Authorization is the broker's — `/token` mints only for a destination
+within the grant's `granted_destinations` set — so the sidecar makes no
+authorization decision of its own.
+
+### Control protocol
+
+The worker drives the sidecar over a Unix-domain control socket:
+
+- `POST /actions` with `{"grant", "expires_at"}` →
+  `200 {"action_id", "proxy_port", "env", "files"}`. The sidecar allocates a
+  per-action loopback proxy on `proxy_port`, bound to that action's
+  delegation `grant`. `env` is the set of variables the worker injects into
+  the action at exec time; `files` (loopback mode only) is an optional list
+  of `{"path", "contents"}` config files the worker writes into the
+  action's filesystem for tools that env alone cannot redirect. The exact
+  `env`/`files` shape depends on the configured `egress_mode` (see
+  [Egress path](#egress-path)).
+- `DELETE /actions/{action_id}` → `200`. The action's proxy and cached
+  credentials are torn down. Actions are also evicted automatically at
+  `expires_at`.
+
+### Egress path
+
+`egress_mode` selects how the per-action proxy intercepts traffic.
+**`loopback` is the default.**
+
+In **both** modes the credential core is identical: the proxy looks up the
+destination mapped to the request's host, exchanges the action's grant for
+a credential at `/token` (caching it per `(action, destination)` and
+re-minting shortly before expiry), injects it as an `Authorization`
+header, and forwards over TLS to the real upstream. A host with no
+destination mapping is rejected with `403`; a broker `403` (the grant does
+not grant that destination), any broker error, or an unknown action
+**fails closed** (no forward). Every request emits one structured audit
+line. The modes differ only in how the action's client is pointed at the
+proxy.
+
+#### `loopback` (default)
+
+The per-action listener serves **plain HTTP** on the loopback port and
+**reverse-proxies** each request to the mapped upstream over real TLS. No
+MITM CA is involved, so tools whose TLS stack ignores env-supplied CAs —
+notably `uv` and `cargo`'s registry path, which default to
+`rustls`+`webpki-roots` — work unmodified. (This is why loopback is the
+default: MITM certs are silently rejected by those primary tools.)
+
+Addressing is **single per-action port with the upstream encoded in the
+path prefix**: the first path segment of an origin-form request names the
+broker destination, which selects the upstream host. The remainder of the
+path and the query are forwarded verbatim:
+
+```
+GET http://127.0.0.1:<port>/<destination>/<upstream-path>?<q>
+      ->  https://<host(destination)>/<upstream-path>?<q>   (Authorization injected)
+```
+
+A path prefix that does not name a mapped destination is `403`. One port
+carries every mapped upstream for the action, so the single-`proxy_port`
+control contract is unchanged.
+
+The returned `env` points each tool at its loopback route:
+
+- **catch-all** — `HTTP_PROXY`/`HTTPS_PROXY` (and lower-case) =
+  `http://127.0.0.1:<port>`, plus `NO_PROXY` keeping in-cluster traffic
+  direct. A tool that honours the proxy env reaches any mapped host even
+  without a per-tool override (plain-HTTP requests are reverse-proxied by
+  host; `CONNECT` to a mapped host is blind-tunnelled — no injection, since
+  authenticated traffic flows through the per-tool route).
+- **pypi (`uv`, `pip`)** — when a host is tagged `pypi` in
+  `host_tool_map`: `UV_DEFAULT_INDEX`, `UV_INDEX`, `PIP_INDEX_URL`,
+  `PIP_EXTRA_INDEX_URL` = `http://127.0.0.1:<port>/<destination>`.
+
+`EGRESS_AUTHD_CA_PEM` is **not** emitted in loopback mode (there is no CA).
+
+**Upstream base paths.** The reverse-proxy strips the `/<destination>`
+prefix and forwards the remainder verbatim. When the upstream registry
+does not live at the host root — e.g. a registry whose virtual PyPI
+simple index is at `/api/pypi/<repo>/simple` — record
+that path in `host_base_path_map` for the host. The proxy **prepends** it
+to the (prefix-stripped) request path, so the per-tool env override stays
+the clean loopback route and the tool appends its own sub-paths. Hosts
+absent from `host_base_path_map` forward at the host root.
+
+Some tools cannot be pointed at a loopback URL by env alone; for a host
+tagged with one of these, the sidecar returns the needed config in the
+`files` array and the worker materialises each entry (the `path` is a hint
+relative to the action's home directory):
+
+| tool tag | file (`path`)                          | mechanism                                   |
+|----------|----------------------------------------|---------------------------------------------|
+| `cargo`  | `.cargo/config.toml`                   | `[source.crates-io] replace-with` → sparse `…/<destination>/` |
+| `docker` | `.config/containers/registries.conf`   | `[[registry.mirror]]` → `127.0.0.1:<port>/<destination>` (`insecure`) |
+| `git`    | `.gitconfig`                           | `url.<route>.insteadOf = https://<host>/`   |
+
+The `cargo`/`docker`/`git` redirects do **not** block the `uv`/`pip` path:
+they are additive per-host based on the tag.
+
+#### `mitm`
+
+The per-action listener is an `HTTPS_PROXY` that terminates the action's
+`CONNECT` tunnels with a per-action ephemeral CA, then injects on the
+decrypted requests. Tool-agnostic for any client that honours `HTTPS_PROXY`
+**and** trusts an env-supplied CA. The returned `env` is
+`HTTP_PROXY`/`HTTPS_PROXY` = `http://127.0.0.1:<port>`, `NO_PROXY`, and
+`EGRESS_AUTHD_CA_PEM` carrying the per-action CA the action must trust; no
+`files` are returned. Select it with `egress_mode: 'mitm'` when the action's
+toolchain honours both the proxy env and an env-supplied trust store.
+
+### Configuration
+
+The sidecar is configured by a flat Jsonnet file mirroring the broker's
+style; see
+[`examples/egress-authd.jsonnet`](./examples/egress-authd.jsonnet). The
+schema is flat — a host allow-list and a host->destination route table,
+with no authorization policy of its own. The grant scope (set at
+`/delegate`) is the authorization, so the sidecar only needs to know which
+broker destination authenticates which upstream host. The
+`host_destination_map` mirrors the broker's `destinations.jsonnet` for the
+same cluster.
+
+```jsonnet
+{
+  broker_token_url: 'https://broker.example.com',  // sidecar appends /token
+  listen_socket:    '/var/run/egress-authd/control.sock',
+  proxy_port_range: [15000, 15999],
+  egress_mode:      'loopback',  // default; 'mitm' for the legacy CONNECT path
+
+  // Simple, one-tool-per-host form. The union of these hosts and `routes`
+  // is the allow-list; a request to any other host fails closed.
+  host_destination_map: { 'registry.example.com': 'registry' },
+  // Optional: tag a host with the tool whose private registry it serves so
+  // loopback mode emits that tool's native override.
+  host_tool_map:        { 'registry.example.com': 'pypi' },
+  // Optional: upstream base path the reverse-proxy prepends (so the env
+  // override can stay the bare loopback route).
+  host_base_path_map:   { 'registry.example.com': '/api/pypi/index/simple' },
+
+  // Multi-tool form: when ONE host serves several tools' registries (a
+  // registry serving pypi + cargo + docker), give one route
+  // per tool, each with a DISTINCT destination, tool tag and base path, so
+  // they coexist on the same host with separate credentials and separate
+  // loopback path prefixes. `routes` and the `host_*_map` fields may both
+  // be set; each destination must be unique across all routes.
+  routes: [
+    { host: 'multi.example.com', destination: 'reg-pypi',   tool: 'pypi',   base_path: '/api/pypi/index/simple' },
+    { host: 'multi.example.com', destination: 'reg-cargo',  tool: 'cargo',  base_path: '/api/cargo/index' },
+    { host: 'multi.example.com', destination: 'reg-docker', tool: 'docker' },
+  ],
+}
+```
+
+The worker passes the delegation grant it obtained from `/delegate` on
+each `POST /actions`; no projected ServiceAccount token or broker-side
+allow-list is involved. The `/token` source-CIDR gate must admit the
+sidecar's pod network.
+
 ## Building
 
 ```sh
-make build         # ./bin/bb-credential-broker
+make build         # ./bin/bb-credential-broker AND ./bin/egress-authd
 make test          # unit tests
 make lint          # golangci-lint
-make docker-build  # multi-stage build, distroless/static runtime
-make docker-run    # run the development image with examples/config.jsonnet
+make docker-build  # both images, distroless/static runtime
+make docker-run    # run the development broker image with examples/config.jsonnet
+```
+
+The two binaries build independently:
+
+```sh
+make build-broker          docker-build-broker          # broker (Dockerfile)
+make build-egress-authd    docker-build-egress-authd    # sidecar (Dockerfile.egress-authd)
 ```
 
 ## Operating
@@ -677,6 +858,28 @@ Destinations that perform no upstream call — the `staticSecret`
 type — omit the `upstream_url`, `upstream_status`,
 `upstream_duration_ms` and `upstream_response_excerpt` fields
 entirely.
+
+The `egress-authd` sidecar emits its own separate audit stream
+(`"event": "egress"`, one line per proxied request). It carries no
+identity of its own — the sidecar relays an opaque grant and the broker
+owns the authorization decision — so the `action_id` is the join key back
+to the broker's own `/delegate` and `/token` records for that grant:
+
+```json
+{
+  "ts": "2026-05-21T10:24:30.789Z",
+  "event": "egress",
+  "action_id": "Yt0v…",
+  "host": "registry.example.com",
+  "destination": "registry-pypi",
+  "decision": "forwarded_injected",
+  "status_code": 200
+}
+```
+
+`decision` is one of `forwarded_injected`, `forwarded_no_inject`,
+`denied_host`, `fail_closed_broker`, `denied_unknown_action`, or `error`;
+`reason` carries operator-readable detail on a rejection.
 
 #### Canonical denial reasons
 

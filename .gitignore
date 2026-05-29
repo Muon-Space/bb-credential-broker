@@ -28,3 +28,7 @@ vendor/
 
 # Direnv
 .envrc.local
+
+# Local Claude Code agent files
+/CLAUDE.md
+.claude/

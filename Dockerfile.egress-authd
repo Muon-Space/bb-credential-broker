@@ -1,0 +1,36 @@
+# syntax=docker/dockerfile:1.7
+#
+# Image for the egress-authd sidecar. Mirrors the broker Dockerfile's
+# pipeline (multi-stage, CGO-disabled static build on distroless/static)
+# so both binaries ship from the same toolchain and base image.
+
+FROM golang:1.25-bookworm AS builder
+
+WORKDIR /src
+
+# Cache module downloads in a separate layer so source-only rebuilds do
+# not invalidate the dependency cache.
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+
+COPY . .
+
+ARG TARGETOS
+ARG TARGETARCH
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -trimpath -ldflags='-s -w' \
+    -o /out/egress-authd ./cmd/egress-authd
+
+# Runtime stage. distroless/static contains only ca-certificates, the
+# nonroot /etc/passwd entries and tzdata. There is no shell and no
+# package manager; the sidecar binary is the only executable.
+FROM gcr.io/distroless/static-debian12:nonroot
+
+COPY --from=builder /out/egress-authd /usr/local/bin/egress-authd
+
+USER nonroot:nonroot
+ENTRYPOINT ["/usr/local/bin/egress-authd"]
