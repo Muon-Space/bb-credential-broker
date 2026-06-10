@@ -12,8 +12,9 @@ env:
   REGISTRY: ghcr.io
   # GHCR image names must be lowercase, so the owner segment is
   # spelled muon-space rather than the repository's mixed-case
-  # Muon-Space.
-  IMAGE_NAME: muon-space/bb-credential-broker
+  # Muon-Space. The repo ships two images under this owner:
+  # bb-credential-broker and egress-authd.
+  IMAGE_OWNER: muon-space
 
 jobs:
   lint:
@@ -61,11 +62,14 @@ jobs:
           go run ./cmd/bb-credential-broker validate examples/config.jsonnet
 
   build:
-    name: build ${{ matrix.target.platform }}
+    name: build ${{ matrix.binary.name }} ${{ matrix.target.platform }}
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
+        binary:
+          - { name: bb-credential-broker, cmd: ./cmd/bb-credential-broker }
+          - { name: egress-authd,         cmd: ./cmd/egress-authd }
         target:
           - { platform: linux_amd64,    goos: linux,   goarch: amd64, goamd64: "",  goarm: "",  ext: "" }
           - { platform: linux_amd64_v3, goos: linux,   goarch: amd64, goamd64: v3,  goarm: "",  ext: "" }
@@ -82,7 +86,7 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
-      - name: Build ${{ matrix.target.platform }}
+      - name: Build ${{ matrix.binary.name }} ${{ matrix.target.platform }}
         env:
           CGO_ENABLED: "0"
           GOOS: ${{ matrix.target.goos }}
@@ -90,17 +94,17 @@ jobs:
           GOAMD64: ${{ matrix.target.goamd64 }}
           GOARM: ${{ matrix.target.goarm }}
         run: |
-          OUT="bb-credential-broker.${{ matrix.target.platform }}${{ matrix.target.ext }}"
-          go build -trimpath -ldflags='-s -w' -o "${OUT}" ./cmd/bb-credential-broker
+          OUT="${{ matrix.binary.name }}.${{ matrix.target.platform }}${{ matrix.target.ext }}"
+          go build -trimpath -ldflags='-s -w' -o "${OUT}" ${{ matrix.binary.cmd }}
           echo "OUT=${OUT}" >> "$GITHUB_ENV"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: bb-credential-broker.${{ matrix.target.platform }}
+          name: ${{ matrix.binary.name }}.${{ matrix.target.platform }}
           path: ${{ env.OUT }}
           if-no-files-found: error
 
   docker:
-    name: docker ${{ matrix.arch.tag }}
+    name: docker ${{ matrix.image.name }} ${{ matrix.arch.tag }}
     runs-on: ${{ matrix.arch.runner }}
     permissions:
       contents: read
@@ -108,6 +112,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        image:
+          - { name: bb-credential-broker, dockerfile: ./Dockerfile,              title: bb-credential-broker, description: "Mints short-lived per-build identity credentials for Buildbarn workers." }
+          - { name: egress-authd,         dockerfile: ./Dockerfile.egress-authd, title: egress-authd,         description: "Per-action egress proxy sidecar that injects broker-minted credentials into a Buildbarn action's outbound traffic." }
         arch:
           - { platform: linux/amd64, runner: ubuntu-24.04,     tag: linux-amd64 }
           - { platform: linux/arm64, runner: ubuntu-24.04-arm, tag: linux-arm64 }
@@ -127,20 +134,20 @@ jobs:
       - uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
           context: .
-          file: ./Dockerfile
+          file: ${{ matrix.image.dockerfile }}
           push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}-${{ matrix.arch.tag }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ matrix.image.name }}:${{ steps.vars.outputs.image_tag }}-${{ matrix.arch.tag }}
           platforms: ${{ matrix.arch.platform }}
-          cache-from: type=gha,scope=bb-credential-broker-${{ matrix.arch.tag }}
-          cache-to: type=gha,mode=max,scope=bb-credential-broker-${{ matrix.arch.tag }}
+          cache-from: type=gha,scope=${{ matrix.image.name }}-${{ matrix.arch.tag }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}-${{ matrix.arch.tag }}
           provenance: false
           outputs: type=image,push=true,compression=gzip,compression-level=6,force-compression=true
           labels: |
             org.opencontainers.image.created=${{ steps.vars.outputs.build_date }}
             org.opencontainers.image.version=${{ steps.vars.outputs.image_tag }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.title=bb-credential-broker
-            org.opencontainers.image.description=Mints short-lived per-build identity credentials for Buildbarn workers.
+            org.opencontainers.image.title=${{ matrix.image.title }}
+            org.opencontainers.image.description=${{ matrix.image.description }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.licenses=Apache-2.0
 
@@ -163,13 +170,15 @@ jobs:
           echo "image_tag=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
       - name: Push sha and latest manifests
         run: |
-          FULL_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           TAG=${{ steps.vars.outputs.image_tag }}
-          for ALIAS in ${TAG} latest; do
-            docker manifest create ${FULL_IMAGE}:${ALIAS} \
-              ${FULL_IMAGE}:${TAG}-linux-amd64 \
-              ${FULL_IMAGE}:${TAG}-linux-arm64
-            docker manifest push ${FULL_IMAGE}:${ALIAS}
+          for IMG in bb-credential-broker egress-authd; do
+            FULL_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${IMG}
+            for ALIAS in ${TAG} latest; do
+              docker manifest create ${FULL_IMAGE}:${ALIAS} \
+                ${FULL_IMAGE}:${TAG}-linux-amd64 \
+                ${FULL_IMAGE}:${TAG}-linux-arm64
+              docker manifest push ${FULL_IMAGE}:${ALIAS}
+            done
           done
 
   publish:
@@ -202,16 +211,18 @@ jobs:
           git tag $RELEASE_TAG
           git push --follow-tags
           echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
-      - name: Tag container manifest with release tag
+      - name: Tag container manifests with release tag
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
-          FULL_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           SHA_TAG=${GITHUB_SHA::7}
           RELEASE_TAG="${{ steps.create_tag.outputs.release_tag }}"
-          docker manifest create ${FULL_IMAGE}:${RELEASE_TAG} \
-            ${FULL_IMAGE}:${SHA_TAG}-linux-amd64 \
-            ${FULL_IMAGE}:${SHA_TAG}-linux-arm64
-          docker manifest push ${FULL_IMAGE}:${RELEASE_TAG}
+          for IMG in bb-credential-broker egress-authd; do
+            FULL_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${IMG}
+            docker manifest create ${FULL_IMAGE}:${RELEASE_TAG} \
+              ${FULL_IMAGE}:${SHA_TAG}-linux-amd64 \
+              ${FULL_IMAGE}:${SHA_TAG}-linux-arm64
+            docker manifest push ${FULL_IMAGE}:${RELEASE_TAG}
+          done
       - name: Create GitHub release
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:

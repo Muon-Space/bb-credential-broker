@@ -57,11 +57,14 @@ jobs:
           go run ./cmd/bb-credential-broker validate examples/config.jsonnet
 
   build:
-    name: build ${{ matrix.target.platform }}
+    name: build ${{ matrix.binary.name }} ${{ matrix.target.platform }}
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
+        binary:
+          - { name: bb-credential-broker, cmd: ./cmd/bb-credential-broker }
+          - { name: egress-authd,         cmd: ./cmd/egress-authd }
         target:
           - { platform: linux_amd64,    goos: linux,   goarch: amd64, goamd64: "",  goarm: "",  ext: "" }
           - { platform: linux_amd64_v3, goos: linux,   goarch: amd64, goamd64: v3,  goarm: "",  ext: "" }
@@ -78,7 +81,7 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
-      - name: Build ${{ matrix.target.platform }}
+      - name: Build ${{ matrix.binary.name }} ${{ matrix.target.platform }}
         env:
           CGO_ENABLED: "0"
           GOOS: ${{ matrix.target.goos }}
@@ -86,15 +89,18 @@ jobs:
           GOAMD64: ${{ matrix.target.goamd64 }}
           GOARM: ${{ matrix.target.goarm }}
         run: |
-          OUT="bb-credential-broker.${{ matrix.target.platform }}${{ matrix.target.ext }}"
-          go build -trimpath -ldflags='-s -w' -o "${OUT}" ./cmd/bb-credential-broker
+          OUT="${{ matrix.binary.name }}.${{ matrix.target.platform }}${{ matrix.target.ext }}"
+          go build -trimpath -ldflags='-s -w' -o "${OUT}" ${{ matrix.binary.cmd }}
 
   docker:
-    name: docker ${{ matrix.arch.tag }}
+    name: docker ${{ matrix.image.name }} ${{ matrix.arch.tag }}
     runs-on: ${{ matrix.arch.runner }}
     strategy:
       fail-fast: false
       matrix:
+        image:
+          - { name: bb-credential-broker, dockerfile: ./Dockerfile }
+          - { name: egress-authd,         dockerfile: ./Dockerfile.egress-authd }
         arch:
           - { platform: linux/amd64, runner: ubuntu-24.04,     tag: linux-amd64 }
           - { platform: linux/arm64, runner: ubuntu-24.04-arm, tag: linux-arm64 }
@@ -104,10 +110,10 @@ jobs:
       - uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
           context: .
-          file: ./Dockerfile
+          file: ${{ matrix.image.dockerfile }}
           push: false
           load: false
           platforms: ${{ matrix.arch.platform }}
-          cache-from: type=gha,scope=bb-credential-broker-${{ matrix.arch.tag }}
-          cache-to: type=gha,mode=max,scope=bb-credential-broker-${{ matrix.arch.tag }}
+          cache-from: type=gha,scope=${{ matrix.image.name }}-${{ matrix.arch.tag }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}-${{ matrix.arch.tag }}
           provenance: false
