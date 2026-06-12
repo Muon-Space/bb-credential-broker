@@ -69,16 +69,19 @@ func TestLoopback_MappedDestinationInjectsAndForwards(t *testing.T) {
 	}
 }
 
-func TestLoopback_BasePathPrependedToUpstream(t *testing.T) {
+func TestLoopback_BasePathContainment(t *testing.T) {
 	t.Parallel()
 	_, upstreamPool, host := startFakeUpstream(t)
 
 	cfg := &Config{
 		HostDestinationMap: map[string]string{host: "registry-pypi"},
 		HostToolMap:        map[string]string{host: ToolPyPI},
-		// A registry's virtual PyPI repo base path; the reverse-proxy
-		// must prepend it to the (prefix-stripped) request path.
-		HostBasePathMap: map[string]string{host: "/api/pypi/index/simple"},
+		// The registry's package-repo ROOT. The loopback URL embeds it
+		// after the destination segment (mirroring the upstream path so
+		// upstream-emitted relative links resolve inside the destination
+		// namespace); the reverse-proxy enforces it as a containment
+		// subtree and forwards the path verbatim.
+		HostBasePathMap: map[string]string{host: "/api/pypi/index"},
 	}
 	action := &Action{ID: "a", Grant: "g", ExpiresAt: time.Now().Add(time.Hour)}
 	broker := &fakeBroker{tok: &MintedToken{Token: "t", Scheme: "bearer", ExpiresAt: time.Now().Add(time.Hour)}}
@@ -86,9 +89,10 @@ func TestLoopback_BasePathPrependedToUpstream(t *testing.T) {
 
 	_, client, base := newLoopbackProxyForTest(t, cfg, action, broker, upstreamPool, audit)
 
-	// uv would request <route>/<pkg>/; the proxy strips /registry-pypi
-	// and prepends the base path.
-	resp, err := client.Get(base + "/registry-pypi/requests/")
+	// uv requests <route>/simple/<pkg>/ where <route> already embeds the
+	// base path; the proxy strips only /registry-pypi and forwards the
+	// rest verbatim.
+	resp, err := client.Get(base + "/registry-pypi/api/pypi/index/simple/requests/")
 	if err != nil {
 		t.Fatalf("GET via loopback: %v", err)
 	}
@@ -98,6 +102,35 @@ func TestLoopback_BasePathPrependedToUpstream(t *testing.T) {
 	}
 	if got := resp.Header.Get("X-Seen-Authorization"); got != "Bearer t" {
 		t.Errorf("injected auth: got %q, want Bearer t", got)
+	}
+
+	// A relative file link emitted by the index (../../packages/... from
+	// <root>/simple/<pkg>/) resolves to a SIBLING of /simple inside the
+	// base-path subtree — it must be forwarded, authenticated, verbatim.
+	resp2, err := client.Get(base + "/registry-pypi/api/pypi/index/packages/aa/bb/pkg-1.0.whl")
+	if err != nil {
+		t.Fatalf("GET package file via loopback: %v", err)
+	}
+	defer func() { _ = resp2.Body.Close() }()
+	if got, want := resp2.Header.Get("X-Seen-Path"), "/api/pypi/index/packages/aa/bb/pkg-1.0.whl"; got != want {
+		t.Errorf("forwarded file path: got %q, want %q", got, want)
+	}
+	if got := resp2.Header.Get("X-Seen-Authorization"); got != "Bearer t" {
+		t.Errorf("injected auth on file fetch: got %q, want Bearer t", got)
+	}
+
+	// A path that escapes the base-path subtree fails closed: a mapped
+	// destination must not become a door to arbitrary upstream paths.
+	resp3, err := client.Get(base + "/registry-pypi/etc/secrets")
+	if err != nil {
+		t.Fatalf("GET escaping path via loopback: %v", err)
+	}
+	defer func() { _ = resp3.Body.Close() }()
+	if resp3.StatusCode != http.StatusForbidden {
+		t.Errorf("escape status: got %d, want 403 (path outside destination base path)", resp3.StatusCode)
+	}
+	if got := resp3.Header.Get("X-Seen-Authorization"); got != "" {
+		t.Errorf("escaping request reached upstream (saw auth %q)", got)
 	}
 }
 
@@ -268,17 +301,19 @@ func TestLoopback_ControlEnvReturnsLoopbackURLs(t *testing.T) {
 	}
 
 	base := fmt.Sprintf("http://127.0.0.1:%d", created.ProxyPort)
-	wantRoute := base + "/registry-pypi"
+	// The route embeds the (empty, here) base path; the PEP 503 simple
+	// index lives under it.
+	wantIndex := base + "/registry-pypi/simple"
 
 	// Catch-all proxy points at the loopback base.
 	if created.Env["HTTP_PROXY"] != base || created.Env["HTTPS_PROXY"] != base {
 		t.Errorf("catch-all proxy: got HTTP_PROXY=%q HTTPS_PROXY=%q, want %q",
 			created.Env["HTTP_PROXY"], created.Env["HTTPS_PROXY"], base)
 	}
-	// Per-tool index overrides point at the per-destination route.
+	// Per-tool index overrides point at the per-destination simple index.
 	for _, key := range []string{"UV_DEFAULT_INDEX", "UV_INDEX", "PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL"} {
-		if created.Env[key] != wantRoute {
-			t.Errorf("%s: got %q, want %q", key, created.Env[key], wantRoute)
+		if created.Env[key] != wantIndex {
+			t.Errorf("%s: got %q, want %q", key, created.Env[key], wantIndex)
 		}
 	}
 	// The MITM CA PEM must be absent in loopback mode.

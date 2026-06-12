@@ -16,11 +16,22 @@ import (
 // Addressing scheme: the per-action listener serves a single plain-HTTP
 // port and selects the upstream by the FIRST path segment of an
 // origin-form request, which names the broker destination. The rest of
-// the path (and the query) is forwarded to the upstream, with the host's
-// configured base path (if any) prepended:
+// the path MIRRORS the upstream path verbatim — the destination's
+// configured base path is part of the loopback URL the tool is pointed
+// at, and acts as a CONTAINMENT check, not a prepend:
 //
-//	GET http://127.0.0.1:<port>/<destination>/<req-path>?<q>
-//	      -> https://<host(destination)><base-path>/<req-path>?<q>
+//	GET http://127.0.0.1:<port>/<destination><base-path>/<sub>?<q>
+//	      -> https://<host(destination)><base-path>/<sub>?<q>
+//
+// Mirroring the upstream depth is load-bearing: registries emit
+// RELATIVE links computed against their REAL path (a PEP 503 simple
+// index page at <base-path>/simple/<pkg>/ links files via
+// ../../packages/...). Under the old prepend scheme the loopback path
+// was shallower than the upstream path, so those links climbed out of
+// the destination prefix and fail-closed. With the full upstream path
+// embedded after the destination segment, relative resolution stays
+// inside the destination namespace, and any path that escapes the
+// base-path subtree is rejected 403 (fail-closed containment).
 //
 // The destination is the same identifier host_destination_map maps a
 // host to, so the per-tool index/registry env overrides embed it
@@ -50,16 +61,29 @@ func (p *actionProxy) serveLoopbackReverse(w http.ResponseWriter, r *http.Reques
 	}
 	host := upstream.Host
 
+	// Containment: the request path (after the destination segment) must
+	// live inside the route's base-path subtree. This replaces the old
+	// prepend — the client URL already carries the base path — and keeps
+	// the fail-closed property: an action cannot use a mapped destination
+	// to reach arbitrary paths on the upstream host outside the subtree
+	// the route was configured for.
+	if bp := upstream.BasePath; bp != "" && rest != bp && !strings.HasPrefix(rest, bp+"/") {
+		p.logEgress(host, dest, DecisionDeniedHost, http.StatusForbidden, "path outside destination base path")
+		p.metrics.RecordEgress(dest, DecisionDeniedHost)
+		http.Error(w, "path outside destination base path", http.StatusForbidden)
+		return
+	}
+
 	// Rewrite the request to target the real upstream over TLS. The
-	// upstream sees the configured base path (if any) followed by the
-	// request path with the destination prefix stripped, and the mapped
-	// host. Injection uses the matched route's BROKER destination (not a
-	// host re-derivation), so a multi-tool host with per-route broker
-	// destinations mints the credential for exactly the tool route the
-	// loopback prefix selected.
+	// upstream sees the request path with the destination prefix
+	// stripped, verbatim (the base path is already embedded), and the
+	// mapped host. Injection uses the matched route's BROKER destination
+	// (not a host re-derivation), so a multi-tool host with per-route
+	// broker destinations mints the credential for exactly the tool
+	// route the loopback prefix selected.
 	r.URL.Scheme = "https"
 	r.URL.Host = host
-	r.URL.Path = upstream.BasePath + rest
+	r.URL.Path = rest
 	r.Host = host
 
 	decision, status, mappedDest, reason, body := p.injectForDestination(r, upstream.BrokerDestination)
