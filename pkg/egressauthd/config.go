@@ -48,6 +48,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -188,6 +189,22 @@ type Config struct {
 	// addition to the system roots. Operators set it when a
 	// destination presents a certificate chained to a private CA.
 	CABundleFile string `json:"ca_bundle_file,omitempty"`
+
+	// ActionFilesDir is the directory in which the sidecar materialises
+	// per-action helper dotfiles for tools whose proxy redirection cannot
+	// be expressed in environment variables alone (cargo source
+	// replacement, container-tooling registries.conf, git insteadOf).
+	// The path is shared between this sidecar and the action's runtime
+	// container (typically a Kubernetes emptyDir mounted into both): the
+	// sidecar writes <action_files_dir>/<action_id>/<file> and emits
+	// per-tool env variables (CARGO_HOME, CONTAINERS_REGISTRIES_CONF,
+	// GIT_CONFIG_GLOBAL) pointing at those paths. The per-action
+	// subdirectory is created with mode 0700 so concurrent actions on
+	// the same pod cannot enumerate each other's files; cleanup is bound
+	// to the action lifecycle (DELETE /actions/{id} and the TTL sweep).
+	// Required in loopback mode whenever any route carries a tool that
+	// needs a config file (cargo, docker, git).
+	ActionFilesDir string `json:"action_files_dir"`
 
 	// routesOnce guards the one-time computation of routesCache. The
 	// configuration is immutable after loading, so the merged route list
@@ -353,6 +370,31 @@ func (c *Config) Validate() error {
 	}
 	if len(c.routes()) == 0 {
 		return fmt.Errorf("at least one of host_destination_map or routes must map a host to a destination")
+	}
+
+	// action_files_dir is required whenever any route carries a tool
+	// whose redirection is expressed as a config file (cargo, docker,
+	// git): those payloads are materialised under that directory and
+	// referenced from injected env vars (CARGO_HOME, etc.). A pypi-only
+	// or untagged-host-only deployment does not need it; a deployment
+	// that mixes file-needing tools without it would silently fail to
+	// redirect the action's traffic for those tools, so we fail fast.
+	if c.Mode() == EgressModeLoopback {
+		needsFiles := false
+		for _, du := range c.routes() {
+			switch du.Tool {
+			case ToolCargo, ToolDocker, ToolGit:
+				needsFiles = true
+			}
+		}
+		if needsFiles {
+			if c.ActionFilesDir == "" {
+				return fmt.Errorf("action_files_dir is required when any route carries a tool that needs a config file (cargo, docker, git)")
+			}
+			if !filepath.IsAbs(c.ActionFilesDir) {
+				return fmt.Errorf("action_files_dir must be an absolute path, got %q", c.ActionFilesDir)
+			}
+		}
 	}
 	return nil
 }

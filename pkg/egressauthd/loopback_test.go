@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -320,19 +322,25 @@ func TestLoopback_ControlEnvReturnsLoopbackURLs(t *testing.T) {
 	if _, ok := created.Env["EGRESS_AUTHD_CA_PEM"]; ok {
 		t.Error("EGRESS_AUTHD_CA_PEM must not be set in loopback mode")
 	}
-	// No files for a pure-pypi mapping (pypi is env-only).
-	if len(created.Files) != 0 {
-		t.Errorf("files: got %v, want none for pypi-only mapping", created.Files)
+	// Pypi is env-only — no helper files for this route.
+	for _, key := range []string{"CARGO_HOME", "CONTAINERS_REGISTRIES_CONF", "GIT_CONFIG_GLOBAL"} {
+		if v, ok := created.Env[key]; ok {
+			t.Errorf("%s must not be set for pypi-only mapping, got %q", key, v)
+		}
 	}
 }
 
-// TestLoopback_ControlEnvReturnsConfigFiles asserts that cargo, docker
-// and git tags produce written config files (env alone is insufficient)
-// while pypi stays env-only.
-func TestLoopback_ControlEnvReturnsConfigFiles(t *testing.T) {
+// TestLoopback_ActionFilesDir_MaterialisesAndCleansUp asserts that
+// cargo, docker and git tags cause the sidecar to materialise per-tool
+// config files under <ActionFilesDir>/<action_id>/, emit env vars
+// pointing at those paths, and remove the per-action directory on
+// DELETE /actions/{id}. Pypi stays env-only.
+func TestLoopback_ActionFilesDir_MaterialisesAndCleansUp(t *testing.T) {
 	t.Parallel()
+	filesDir := t.TempDir()
 	cfg := &Config{
 		EgressMode:     EgressModeLoopback,
+		ActionFilesDir: filesDir,
 		ProxyPortRange: [2]int{21300, 21500},
 		HostDestinationMap: map[string]string{
 			"cargo.example.com":    "registry-cargo",
@@ -359,39 +367,67 @@ func TestLoopback_ControlEnvReturnsConfigFiles(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 
-	byPath := map[string]string{}
-	for _, f := range created.Files {
-		byPath[f.Path] = f.Contents
+	actionDir := filepath.Join(filesDir, created.ActionID)
+	info, err := os.Stat(actionDir)
+	if err != nil {
+		t.Fatalf("per-action dir not created at %s: %v", actionDir, err)
 	}
-	cargo, ok := byPath[".cargo/config.toml"]
-	if !ok {
-		t.Fatalf("expected a cargo config file; got files %v", keysOf(byPath))
+	if !info.IsDir() {
+		t.Fatalf("%s is not a directory", actionDir)
 	}
-	if !strings.Contains(cargo, "replace-with") || !strings.Contains(cargo, "/registry-cargo") {
-		t.Errorf("cargo config does not redirect to the loopback route: %s", cargo)
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Errorf("per-action dir mode: got %o, want 0700 (cross-action isolation)", got)
 	}
-	docker, ok := byPath[".config/containers/registries.conf"]
-	if !ok {
-		t.Fatalf("expected a docker registries.conf; got files %v", keysOf(byPath))
-	}
-	if !strings.Contains(docker, "registry.example.com") || !strings.Contains(docker, "/registry-docker") {
-		t.Errorf("docker config does not mirror the upstream to the loopback route: %s", docker)
-	}
-	git, ok := byPath[".gitconfig"]
-	if !ok {
-		t.Fatalf("expected a gitconfig; got files %v", keysOf(byPath))
-	}
-	if !strings.Contains(git, "insteadOf") || !strings.Contains(git, "https://git.example.com/") {
-		t.Errorf("gitconfig does not rewrite the upstream: %s", git)
-	}
-}
 
-func keysOf(m map[string]string) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
+	// Each tool's env var must point at a file under the action dir, and
+	// that file's contents must match the per-tool generator.
+	cases := []struct {
+		envKey       string
+		wantPathSub  string
+		wantContents []string
+	}{
+		{"CARGO_HOME", "/cargo", []string{"replace-with", "/registry-cargo"}},
+		{"CONTAINERS_REGISTRIES_CONF", "/registries.conf", []string{"registry.example.com", "/registry-docker"}},
+		{"GIT_CONFIG_GLOBAL", "/gitconfig", []string{"insteadOf", "https://git.example.com/"}},
 	}
-	return out
+	for _, c := range cases {
+		envVal, ok := created.Env[c.envKey]
+		if !ok {
+			t.Errorf("%s env var was not emitted; env=%v", c.envKey, created.Env)
+			continue
+		}
+		if !strings.HasPrefix(envVal, actionDir) {
+			t.Errorf("%s=%q does not live under the per-action dir %s", c.envKey, envVal, actionDir)
+		}
+		// CARGO_HOME points at a directory; the file we wrote is
+		// $CARGO_HOME/config.toml.
+		filePath := envVal
+		if c.envKey == "CARGO_HOME" {
+			filePath = filepath.Join(envVal, "config.toml")
+		}
+		// #nosec G304 -- test-controlled path: filePath is derived from
+		// the env value the sidecar just emitted into t.TempDir(); the
+		// whole point of the test is to read what it wrote.
+		b, err := os.ReadFile(filePath)
+		if err != nil {
+			t.Errorf("read %s contents at %s: %v", c.envKey, filePath, err)
+			continue
+		}
+		for _, sub := range c.wantContents {
+			if !strings.Contains(string(b), sub) {
+				t.Errorf("%s file at %s does not contain %q; got:\n%s", c.envKey, filePath, sub, b)
+			}
+		}
+	}
+
+	// DELETE removes the per-action dir.
+	rec = doRequest(t, handler, http.MethodDelete, "/actions/"+created.ActionID, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("DELETE /actions/%s: got %d (body=%s)", created.ActionID, rec.Code, rec.Body.String())
+	}
+	if _, err := os.Stat(actionDir); !os.IsNotExist(err) {
+		t.Errorf("per-action dir was not removed on DELETE: stat err = %v", err)
+	}
 }
 
 // TestLoopback_CatchAllPlainHTTPProxy confirms that an absolute-form

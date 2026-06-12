@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -71,32 +73,15 @@ type createActionRequest struct {
 }
 
 // createActionResponse is the JSON body /actions returns on success:
-// the action_id, the loopback proxy port, the env the
-// worker injects into the action at exec time, and (loopback mode only)
-// any config files the worker must materialise for tools that cannot be
-// pointed at the loopback endpoint by env alone.
+// the action_id, the loopback proxy port, and the environment variables
+// the worker injects into the action at exec time. Per-tool config files
+// (cargo, docker, git) are materialised under
+// <Config.ActionFilesDir>/<action_id>/ by the sidecar itself and
+// referenced from env vars in Env; the worker does not write files.
 type createActionResponse struct {
 	ActionID  string            `json:"action_id"`
 	ProxyPort int               `json:"proxy_port"`
 	Env       map[string]string `json:"env"`
-	// Files is the optional set of config files the worker writes into
-	// the action's filesystem before exec. It is populated in loopback
-	// mode for tools (cargo source replacement, docker/OCI registry
-	// mirror, git insteadOf) whose redirection cannot be expressed
-	// purely through environment variables. Empty (and omitted) in MITM
-	// mode and when no mapped host carries such a tool tag. The path is
-	// a hint relative to the action's home directory unless absolute;
-	// the worker owns the final placement.
-	Files []ActionFile `json:"files,omitempty"`
-}
-
-// ActionFile is one config file the worker materialises for the action
-// in loopback mode. Path is a placement hint (relative to
-// the action's home directory unless absolute); Contents is the exact
-// file body.
-type ActionFile struct {
-	Path     string `json:"path"`
-	Contents string `json:"contents"`
 }
 
 // handleActions serves POST /actions: it validates the grant,
@@ -142,18 +127,31 @@ func (cs *controlServer) handleActions(w http.ResponseWriter, r *http.Request) {
 	}
 	action.ProxyPort = port
 
+	// Build the env (and materialise the per-action helper-file directory
+	// in loopback mode) BEFORE registering the action, so a write failure
+	// tears down the proxy and surfaces the error to the caller (the
+	// worker) rather than leaving a half-registered action whose env
+	// points at a non-existent dir.
+	env, err := cs.actionEnv(action, proxy)
+	if err != nil {
+		proxy.Close()
+		cs.mu.Lock()
+		delete(cs.usedPorts, port)
+		cs.mu.Unlock()
+		http.Error(w, "could not prepare action env: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	cs.mu.Lock()
 	cs.proxies[actionID] = proxy
 	cs.mu.Unlock()
 	cs.registry.Add(action)
 	cs.metrics.SetActiveActions(len(cs.registry.snapshot()))
 
-	env, files := cs.actionEnv(port, proxy)
 	writeJSON(w, http.StatusOK, createActionResponse{
 		ActionID:  actionID,
 		ProxyPort: port,
 		Env:       env,
-		Files:     files,
 	})
 }
 
@@ -173,17 +171,18 @@ func (cs *controlServer) handleActionByID(w http.ResponseWriter, r *http.Request
 	w.WriteHeader(http.StatusOK)
 }
 
-// actionEnv builds the environment variables (and, in loopback mode,
-// the config files) the worker injects into the action at exec time.
-// The shape depends on the configured egress mode and on
-// the sidecar's route table; it does not depend on the action (every
-// action of this sidecar shares the same routes), so it is built once
-// per registration from the static config.
-func (cs *controlServer) actionEnv(port int, proxy *actionProxy) (map[string]string, []ActionFile) {
+// actionEnv builds the environment variables the worker injects into
+// the action at exec time, and (in loopback mode) materialises the
+// per-action helper config files under
+// <Config.ActionFilesDir>/<action.ID>/ that those env vars reference.
+// The env shape depends on the configured egress mode and the
+// sidecar's route table; the per-action directory and file contents
+// are otherwise identical across actions of one sidecar.
+func (cs *controlServer) actionEnv(action *Action, proxy *actionProxy) (map[string]string, error) {
 	if cs.cfg.Mode() == EgressModeLoopback {
-		return cs.loopbackActionEnv(port)
+		return cs.loopbackActionEnv(action)
 	}
-	return cs.mitmActionEnv(port, proxy), nil
+	return cs.mitmActionEnv(action.ProxyPort, proxy), nil
 }
 
 // mitmActionEnv is the original MITM env: HTTP_PROXY/HTTPS_PROXY point
@@ -208,17 +207,24 @@ func (cs *controlServer) mitmActionEnv(port int, proxy *actionProxy) map[string]
 	return env
 }
 
-// loopbackActionEnv builds the loopback-mode env and files. The base is
-// a plain-HTTP HTTP_PROXY/HTTPS_PROXY catch-all at the loopback port
-// plus NO_PROXY; EGRESS_AUTHD_CA_PEM is intentionally absent because no
-// MITM CA exists. On top of the catch-all, every mapped upstream gets a
-// loopback route under its destination path prefix, and a tagged host
-// (HostToolMap) additionally gets that tool's native index/registry
-// override — as env when env suffices (pypi), or as a written config
-// file when it does not (cargo, docker, git). Tools without a tag still
-// reach their upstream via the catch-all proxy.
-func (cs *controlServer) loopbackActionEnv(port int) (map[string]string, []ActionFile) {
-	base := fmt.Sprintf("http://127.0.0.1:%d", port)
+// loopbackActionEnv builds the loopback-mode env and, for routes whose
+// tool needs a config file (cargo, docker, git), materialises that file
+// under <Config.ActionFilesDir>/<action.ID>/ and emits an env var
+// pointing at it. The base env is a plain-HTTP HTTP_PROXY/HTTPS_PROXY
+// catch-all at the loopback port plus NO_PROXY; EGRESS_AUTHD_CA_PEM is
+// intentionally absent because no MITM CA exists. On top of the
+// catch-all, every mapped upstream gets a loopback route under its
+// destination path prefix, and a tagged host (HostToolMap) additionally
+// gets that tool's native index/registry override — as env when env
+// suffices (pypi), or as the env+file pair when it does not.
+//
+// The per-action directory is created with mode 0700 so concurrent
+// actions on the same pod cannot enumerate each other's helper files
+// (the action_id itself is 128 bits of base64-URL entropy, so guessing
+// is infeasible; 0700 is defence-in-depth). Cleanup is bound to the
+// action lifecycle in teardownAction.
+func (cs *controlServer) loopbackActionEnv(action *Action) (map[string]string, error) {
+	base := fmt.Sprintf("http://127.0.0.1:%d", action.ProxyPort)
 	env := map[string]string{
 		// Catch-all so any tool that honours the proxy env reaches a
 		// mapped host even without a per-tool override. Plain HTTP to the
@@ -232,7 +238,42 @@ func (cs *controlServer) loopbackActionEnv(port int) (map[string]string, []Actio
 		"no_proxy":    cs.noProxy(),
 	}
 
-	var files []ActionFile
+	// Lazy: only allocate the per-action dir the first time a route
+	// produces a file. A pypi-only or untagged-host-only deployment
+	// touches the filesystem zero times.
+	var actionDir string
+	ensureDir := func() error {
+		if actionDir != "" {
+			return nil
+		}
+		if cs.cfg.ActionFilesDir == "" {
+			// Config.Validate prevents this at startup whenever a
+			// file-needing route is present; defensive guard.
+			return fmt.Errorf("action_files_dir is not configured but a route requires per-action helper files")
+		}
+		dir := filepath.Join(cs.cfg.ActionFilesDir, action.ID)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("create per-action helper dir: %w", err)
+		}
+		actionDir = dir
+		return nil
+	}
+	writeFile := func(name, contents string) error {
+		if err := ensureDir(); err != nil {
+			return err
+		}
+		path := filepath.Join(actionDir, name)
+		if d := filepath.Dir(path); d != actionDir {
+			if err := os.MkdirAll(d, 0o700); err != nil {
+				return fmt.Errorf("create per-action helper subdir: %w", err)
+			}
+		}
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			return fmt.Errorf("write %s: %w", name, err)
+		}
+		return nil
+	}
+
 	for _, du := range cs.cfg.mappedUpstreams() {
 		// The per-destination loopback URL mirrors the upstream path:
 		// http://127.0.0.1:<port>/<dest><base-path>. Embedding the base
@@ -262,31 +303,36 @@ func (cs *controlServer) loopbackActionEnv(port int) (map[string]string, []Actio
 			// cargo's registry path defaults to rustls+webpki-roots and
 			// ignores env-supplied CAs and (for the registry) HTTP_PROXY
 			// source selection; source replacement must be expressed in
-			// config. Return a .cargo/config.toml that replaces the
-			// crates.io source with the loopback route.
-			files = append(files, ActionFile{
-				Path:     ".cargo/config.toml",
-				Contents: cargoConfigTOML(route),
-			})
+			// config. Write a config.toml under a per-action CARGO_HOME
+			// that replaces the crates.io source with the loopback route.
+			// CARGO_HOME must be writable: cargo populates
+			// $CARGO_HOME/{registry,git,...} during builds.
+			if err := writeFile("cargo/config.toml", cargoConfigTOML(route)); err != nil {
+				return nil, err
+			}
+			env["CARGO_HOME"] = filepath.Join(actionDir, "cargo")
 		case ToolDocker:
 			// A docker/OCI client cannot be pointed at a loopback mirror
-			// by env; the registry mirror is a daemon/containers config.
-			// Return a containers registries.conf fragment mirroring the
-			// upstream host to the loopback route.
-			files = append(files, ActionFile{
-				Path:     ".config/containers/registries.conf",
-				Contents: dockerRegistriesConf(du.Host, route),
-			})
+			// by env; the registry mirror is daemon/containers
+			// configuration. Write a containers registries.conf mirroring
+			// the upstream host to the loopback route, and point
+			// buildah/podman/skopeo at it via CONTAINERS_REGISTRIES_CONF.
+			if err := writeFile("registries.conf", dockerRegistriesConf(du.Host, route)); err != nil {
+				return nil, err
+			}
+			env["CONTAINERS_REGISTRIES_CONF"] = filepath.Join(actionDir, "registries.conf")
 		case ToolGit:
 			// git has no index env; an insteadOf rewrite in gitconfig
-			// redirects https://<host>/ to the loopback route.
-			files = append(files, ActionFile{
-				Path:     ".gitconfig",
-				Contents: gitInsteadOf(du.Host, route),
-			})
+			// redirects https://<host>/ to the loopback route. Since git
+			// 2.32, GIT_CONFIG_GLOBAL overrides the search for
+			// $HOME/.gitconfig, so the action's HOME is untouched.
+			if err := writeFile("gitconfig", gitInsteadOf(du.Host, route)); err != nil {
+				return nil, err
+			}
+			env["GIT_CONFIG_GLOBAL"] = filepath.Join(actionDir, "gitconfig")
 		}
 	}
-	return env, files
+	return env, nil
 }
 
 // noProxy returns the configured NO_PROXY value or a conservative
@@ -330,8 +376,9 @@ func (cs *controlServer) startProxy(action *Action) (int, *actionProxy, error) {
 }
 
 // teardownAction is the registry eviction hook: it closes the action's
-// proxy, frees its port, and drops its cached credentials. It runs for
-// both explicit DELETEs and TTL expiry.
+// proxy, frees its port, drops its cached credentials, and removes the
+// per-action helper-files directory. It runs for both explicit DELETEs
+// and TTL expiry.
 func (cs *controlServer) teardownAction(a *Action) {
 	cs.mu.Lock()
 	proxy := cs.proxies[a.ID]
@@ -344,6 +391,12 @@ func (cs *controlServer) teardownAction(a *Action) {
 	}
 	if cs.cache != nil {
 		cs.cache.evictAction(a.ID)
+	}
+	if cs.cfg.ActionFilesDir != "" {
+		// Best-effort: a leftover dir is bounded by the next pod restart
+		// (emptyDir is pod-scoped) and is not security-critical (the
+		// contents are routing config, not credentials).
+		_ = os.RemoveAll(filepath.Join(cs.cfg.ActionFilesDir, a.ID))
 	}
 }
 
