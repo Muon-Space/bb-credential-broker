@@ -234,24 +234,30 @@ func (cs *controlServer) loopbackActionEnv(port int) (map[string]string, []Actio
 
 	var files []ActionFile
 	for _, du := range cs.cfg.mappedUpstreams() {
-		// The per-destination loopback URL: http://127.0.0.1:<port>/<dest>
-		route := base + "/" + du.Destination
+		// The per-destination loopback URL mirrors the upstream path:
+		// http://127.0.0.1:<port>/<dest><base-path>. Embedding the base
+		// path in the URL the tool is pointed at (rather than prepending
+		// it in the reverse-proxy) keeps the loopback path depth equal to
+		// the upstream path depth, so RELATIVE links emitted by the
+		// upstream (computed against its real path) resolve to URLs that
+		// stay inside the destination namespace. The reverse-proxy
+		// enforces the base path as a containment subtree (403 outside).
+		route := base + "/" + du.Destination + du.BasePath
 		switch du.Tool {
 		case ToolPyPI:
-			// uv and pip both accept an index URL via env. The override
-			// points at the bare per-destination loopback route; the
-			// tool appends its simple-index sub-paths (e.g. /<pkg>/) and
-			// the reverse-proxy strips the destination prefix and
-			// PREPENDS the host's configured base path before forwarding
-			// to the upstream. So a registry whose virtual index
-			// lives at /api/pypi/<repo>/simple is reached by
-			// setting that as the host's host_base_path_map entry; the
-			// env URL stays the clean loopback route. We expose both the
-			// uv and pip names so either tool is covered.
-			env["UV_DEFAULT_INDEX"] = route
-			env["UV_INDEX"] = route
-			env["PIP_INDEX_URL"] = route
-			env["PIP_EXTRA_INDEX_URL"] = route
+			// uv and pip both accept an index URL via env. For PyPI-style
+			// registries the route's base path must be the PACKAGE-REPO
+			// ROOT (e.g. /api/pypi/<repo>), NOT the .../simple index: the
+			// PEP 503 simple index lives at <root>/simple, but the file
+			// links it serves resolve to sibling paths OUTSIDE /simple
+			// (JFrog: <root>/packages/...), which must stay inside the
+			// containment subtree. We expose both the uv and pip names so
+			// either tool is covered.
+			index := route + "/simple"
+			env["UV_DEFAULT_INDEX"] = index
+			env["UV_INDEX"] = index
+			env["PIP_INDEX_URL"] = index
+			env["PIP_EXTRA_INDEX_URL"] = index
 		case ToolCargo:
 			// cargo's registry path defaults to rustls+webpki-roots and
 			// ignores env-supplied CAs and (for the registry) HTTP_PROXY
