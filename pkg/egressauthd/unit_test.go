@@ -109,7 +109,9 @@ func TestConfig_Validate(t *testing.T) {
 			mutate: func(c *Config) {
 				// A registry serving pypi + cargo + docker: three
 				// routes share the host AND one broker destination, with
-				// distinct loopback prefixes (Destination).
+				// distinct loopback prefixes (Destination). Cargo/docker
+				// require action_files_dir to materialise per-tool
+				// helper files.
 				c.HostDestinationMap = nil
 				c.HostToolMap = nil
 				c.HostBasePathMap = nil
@@ -118,6 +120,7 @@ func TestConfig_Validate(t *testing.T) {
 					{Host: "registry.example.com", Destination: "registry-cargo", BrokerDestination: "registry", Tool: ToolCargo},
 					{Host: "registry.example.com", Destination: "registry-docker", BrokerDestination: "registry", Tool: ToolDocker},
 				}
+				c.ActionFilesDir = "/var/lib/egress-authd/files"
 			},
 		},
 		{
@@ -125,7 +128,8 @@ func TestConfig_Validate(t *testing.T) {
 			mutate: func(c *Config) {
 				// BrokerDestination repeats ("registry") while Destination
 				// (the loopback prefix) stays unique: this MUST validate, it
-				// is the whole point of the split.
+				// is the whole point of the split. Cargo requires
+				// action_files_dir.
 				c.HostDestinationMap = nil
 				c.HostToolMap = nil
 				c.HostBasePathMap = nil
@@ -133,6 +137,7 @@ func TestConfig_Validate(t *testing.T) {
 					{Host: "a.example.com", Destination: "reg-pypi", BrokerDestination: "registry", Tool: ToolPyPI},
 					{Host: "a.example.com", Destination: "reg-cargo", BrokerDestination: "registry", Tool: ToolCargo},
 				}
+				c.ActionFilesDir = "/var/lib/egress-authd/files"
 			},
 		},
 		{
@@ -192,6 +197,41 @@ func TestConfig_Validate(t *testing.T) {
 				c.HostDestinationMap["x"] = ""
 			},
 			wantErr: true,
+		},
+		{
+			name: "cargo route without action_files_dir rejected",
+			mutate: func(c *Config) {
+				c.HostDestinationMap = map[string]string{"crates.example.com": "registry-cargo"}
+				c.HostToolMap = map[string]string{"crates.example.com": ToolCargo}
+				c.ActionFilesDir = ""
+			},
+			wantErr: true,
+		},
+		{
+			name: "git route without action_files_dir rejected",
+			mutate: func(c *Config) {
+				c.HostDestinationMap = map[string]string{"git.example.com": "git-host"}
+				c.HostToolMap = map[string]string{"git.example.com": ToolGit}
+				c.ActionFilesDir = ""
+			},
+			wantErr: true,
+		},
+		{
+			name: "relative action_files_dir rejected",
+			mutate: func(c *Config) {
+				c.HostDestinationMap = map[string]string{"git.example.com": "git-host"}
+				c.HostToolMap = map[string]string{"git.example.com": ToolGit}
+				c.ActionFilesDir = "relative/path"
+			},
+			wantErr: true,
+		},
+		{
+			name: "pypi-only does not require action_files_dir",
+			mutate: func(c *Config) {
+				c.HostDestinationMap = map[string]string{"index.example.com": "registry-pypi"}
+				c.HostToolMap = map[string]string{"index.example.com": ToolPyPI}
+				c.ActionFilesDir = ""
+			},
 		},
 	}
 	for _, tc := range tests {
