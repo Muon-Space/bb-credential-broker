@@ -382,9 +382,9 @@ func TestLoopback_ActionFilesDir_MaterialisesAndCleansUp(t *testing.T) {
 	// Each tool's env var must point at a file under the action dir, and
 	// that file's contents must match the per-tool generator.
 	cases := []struct {
-		envKey        string
-		wantPathSub   string
-		wantContents  []string
+		envKey       string
+		wantPathSub  string
+		wantContents []string
 	}{
 		{"CARGO_HOME", "/cargo", []string{"replace-with", "/registry-cargo"}},
 		{"CONTAINERS_REGISTRIES_CONF", "/registries.conf", []string{"registry.example.com", "/registry-docker"}},
@@ -405,6 +405,9 @@ func TestLoopback_ActionFilesDir_MaterialisesAndCleansUp(t *testing.T) {
 		if c.envKey == "CARGO_HOME" {
 			filePath = filepath.Join(envVal, "config.toml")
 		}
+		// #nosec G304 -- test-controlled path: filePath is derived from
+		// the env value the sidecar just emitted into t.TempDir(); the
+		// whole point of the test is to read what it wrote.
 		b, err := os.ReadFile(filePath)
 		if err != nil {
 			t.Errorf("read %s contents at %s: %v", c.envKey, filePath, err)
