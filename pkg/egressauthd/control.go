@@ -1,11 +1,14 @@
 package egressauthd
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -132,7 +135,7 @@ func (cs *controlServer) handleActions(w http.ResponseWriter, r *http.Request) {
 	// tears down the proxy and surfaces the error to the caller (the
 	// worker) rather than leaving a half-registered action whose env
 	// points at a non-existent dir.
-	env, err := cs.actionEnv(action, proxy)
+	env, err := cs.actionEnv(r.Context(), action, proxy)
 	if err != nil {
 		proxy.Close()
 		cs.mu.Lock()
@@ -178,9 +181,9 @@ func (cs *controlServer) handleActionByID(w http.ResponseWriter, r *http.Request
 // The env shape depends on the configured egress mode and the
 // sidecar's route table; the per-action directory and file contents
 // are otherwise identical across actions of one sidecar.
-func (cs *controlServer) actionEnv(action *Action, proxy *actionProxy) (map[string]string, error) {
+func (cs *controlServer) actionEnv(ctx context.Context, action *Action, proxy *actionProxy) (map[string]string, error) {
 	if cs.cfg.Mode() == EgressModeLoopback {
-		return cs.loopbackActionEnv(action)
+		return cs.loopbackActionEnv(ctx, action)
 	}
 	return cs.mitmActionEnv(action.ProxyPort, proxy), nil
 }
@@ -223,7 +226,7 @@ func (cs *controlServer) mitmActionEnv(port int, proxy *actionProxy) map[string]
 // (the action_id itself is 128 bits of base64-URL entropy, so guessing
 // is infeasible; 0700 is defence-in-depth). Cleanup is bound to the
 // action lifecycle in teardownAction.
-func (cs *controlServer) loopbackActionEnv(action *Action) (map[string]string, error) {
+func (cs *controlServer) loopbackActionEnv(ctx context.Context, action *Action) (map[string]string, error) {
 	base := fmt.Sprintf("http://127.0.0.1:%d", action.ProxyPort)
 	env := map[string]string{
 		// Catch-all so any tool that honours the proxy env reaches a
@@ -274,6 +277,11 @@ func (cs *controlServer) loopbackActionEnv(action *Action) (map[string]string, e
 		return nil
 	}
 
+	// dockerAuths accumulates one base64(username:token) credential per
+	// registry host across all docker routes; it is materialised into a
+	// single docker config.json after the loop (see the ToolDocker case).
+	dockerAuths := map[string]string{}
+
 	for _, du := range cs.cfg.mappedUpstreams() {
 		// The per-destination loopback URL mirrors the upstream path:
 		// http://127.0.0.1:<port>/<dest><base-path>. Embedding the base
@@ -317,10 +325,58 @@ func (cs *controlServer) loopbackActionEnv(action *Action) (map[string]string, e
 			// configuration. Write a containers registries.conf mirroring
 			// the upstream host to the loopback route, and point
 			// buildah/podman/skopeo at it via CONTAINERS_REGISTRIES_CONF.
+			// (buildah/podman/skopeo DO honour the loopback proxy, so the
+			// credential is injected lazily by the proxy for them.)
 			if err := writeFile("registries.conf", dockerRegistriesConf(du.Host, route)); err != nil {
 				return nil, err
 			}
 			env["CONTAINERS_REGISTRIES_CONF"] = filepath.Join(actionDir, "registries.conf")
+
+			// dockerd (docker / docker compose) does NOT read
+			// registries.conf and cannot be pointed at the per-action
+			// loopback proxy: the daemon is shared and started before the
+			// action, so it never sees the per-action env or proxy port.
+			// Mint the broker credential now and accumulate it into the
+			// docker config.json the CLI reads (written once after the
+			// loop, so several docker routes share one file); the CLI
+			// forwards it to the daemon as X-Registry-Auth on the pull.
+			//
+			// Best-effort per route: if this action's grant does not cover
+			// the destination (ErrBrokerDenied) or the mint otherwise
+			// fails, skip this registry's auth rather than failing the
+			// whole action env build. An action that never pulls from this
+			// registry must not break, and one that does will fail closed
+			// at pull time (the registry rejects the unauthenticated
+			// request). The minted token also warms the shared cache, so a
+			// podman/buildah pull through the proxy reuses it.
+			if tok, err := cs.cache.Get(ctx, action, du.BrokerDestination); err != nil {
+				if errors.Is(err, ErrBrokerDenied) {
+					slog.Debug("egress-authd: docker destination not in grant; skipping docker credential",
+						"destination", du.BrokerDestination, "host", du.Host, "action", action.ID)
+				} else {
+					slog.Warn("egress-authd: docker credential mint failed; skipping docker credential",
+						"destination", du.BrokerDestination, "host", du.Host, "action", action.ID, "error", err.Error())
+				}
+			} else if strings.EqualFold(tok.Scheme, "basic") {
+				// dockerd's config.json "auth" is a Basic base64(user:pass)
+				// blob, so ONLY a basic-scheme credential maps onto it. A
+				// bearer-scheme token (e.g. an Artifactory OIDC access token)
+				// has no username, so writing it here would emit
+				// base64(":token") — which docker rejects as "invalid auth
+				// configuration file", poisoning the WHOLE config.json and
+				// breaking EVERY registry in it (including the basic ones).
+				// Bearer-scheme docker routes are served to
+				// buildah/podman/skopeo via the proxy + registries.conf path
+				// instead; dockerd cannot consume them through config.json.
+				username := tok.Username
+				if username == "" {
+					username = dockerAuthFallbackUsername
+				}
+				dockerAuths[du.Host] = basicAuth(username, tok.Token)
+			} else {
+				slog.Debug("egress-authd: docker route is not basic-scheme; not writing a dockerd config.json auth (served via registries.conf/proxy)",
+					"destination", du.BrokerDestination, "host", du.Host, "scheme", tok.Scheme, "action", action.ID)
+			}
 		case ToolGit:
 			// git has no index env; an insteadOf rewrite in gitconfig
 			// redirects https://<host>/ to the loopback route. Since git
@@ -332,6 +388,23 @@ func (cs *controlServer) loopbackActionEnv(action *Action) (map[string]string, e
 			env["GIT_CONFIG_GLOBAL"] = filepath.Join(actionDir, "gitconfig")
 		}
 	}
+
+	// Materialise the aggregated docker config.json once, after every
+	// route has had a chance to contribute its registry credential. The
+	// docker CLI reads $DOCKER_CONFIG/config.json; one file holds the
+	// auths for every docker route whose mint succeeded. When no docker
+	// route produced a credential, DOCKER_CONFIG is not emitted.
+	if len(dockerAuths) > 0 {
+		cfg, err := dockerConfigJSON(dockerAuths)
+		if err != nil {
+			return nil, err
+		}
+		if err := writeFile(".docker/config.json", cfg); err != nil {
+			return nil, err
+		}
+		env["DOCKER_CONFIG"] = filepath.Join(actionDir, ".docker")
+	}
+
 	return env, nil
 }
 

@@ -430,6 +430,175 @@ func TestLoopback_ActionFilesDir_MaterialisesAndCleansUp(t *testing.T) {
 	}
 }
 
+// TestLoopback_DockerConfigJSONForDockerd asserts the docker tool's
+// dockerd-specific output: a per-action .docker/config.json (auths blob)
+// plus DOCKER_CONFIG, which the docker CLI / docker compose read and
+// forward to the daemon as X-Registry-Auth — in addition to the
+// buildah/podman/skopeo registries.conf. dockerd cannot be pointed at
+// the per-action loopback proxy (it is a shared daemon started before
+// the action), so for the docker tool the broker credential is minted at
+// env-build time and materialised here.
+func TestLoopback_DockerConfigJSONForDockerd(t *testing.T) {
+	t.Parallel()
+
+	newCfg := func(filesDir string) *Config {
+		return &Config{
+			EgressMode:     EgressModeLoopback,
+			ActionFilesDir: filesDir,
+			ProxyPortRange: [2]int{21700, 21900},
+			HostDestinationMap: map[string]string{
+				"registry.example.com": "ghe-containers",
+			},
+			HostToolMap: map[string]string{
+				"registry.example.com": ToolDocker,
+			},
+		}
+	}
+	create := func(t *testing.T, cs *controlServer) createActionResponse {
+		t.Helper()
+		createBody, _ := json.Marshal(createActionRequest{Grant: "g"})
+		rec := doRequest(t, cs.Handler(), http.MethodPost, "/actions", createBody)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("POST /actions: got %d (body=%s)", rec.Code, rec.Body.String())
+		}
+		var created createActionResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return created
+	}
+
+	// Happy path: the broker mints a basic-scheme PAT (the GHE container
+	// registry shape), so config.json carries Basic base64(user:token) and
+	// DOCKER_CONFIG points at the per-action .docker dir.
+	t.Run("mints_and_writes_config_json", func(t *testing.T) {
+		t.Parallel()
+		filesDir := t.TempDir()
+		broker := &fakeBroker{tok: &MintedToken{
+			Token: "pat-123", Scheme: "basic", Username: "x-access-token",
+			ExpiresAt: time.Now().Add(time.Hour),
+		}}
+		cs := newControlServer(newCfg(filesDir), newTokenCache(broker, nil), &recordingAudit{}, nil, &tls.Config{MinVersion: tls.VersionTLS12})
+		created := create(t, cs)
+
+		actionDir := filepath.Join(filesDir, created.ActionID)
+		wantDockerConfig := filepath.Join(actionDir, ".docker")
+		if created.Env["DOCKER_CONFIG"] != wantDockerConfig {
+			t.Errorf("DOCKER_CONFIG: got %q, want %q", created.Env["DOCKER_CONFIG"], wantDockerConfig)
+		}
+		// registries.conf is still emitted for buildah/podman/skopeo.
+		if _, ok := created.Env["CONTAINERS_REGISTRIES_CONF"]; !ok {
+			t.Error("CONTAINERS_REGISTRIES_CONF must still be set for the docker route")
+		}
+
+		// #nosec G304 -- test-controlled path under t.TempDir().
+		b, err := os.ReadFile(filepath.Join(wantDockerConfig, "config.json"))
+		if err != nil {
+			t.Fatalf("read docker config.json: %v", err)
+		}
+		var parsed struct {
+			Auths map[string]struct {
+				Auth string `json:"auth"`
+			} `json:"auths"`
+		}
+		if err := json.Unmarshal(b, &parsed); err != nil {
+			t.Fatalf("parse docker config.json (%s): %v", b, err)
+		}
+		entry, ok := parsed.Auths["registry.example.com"]
+		if !ok {
+			t.Fatalf("config.json has no auths entry for registry.example.com; got %s", b)
+		}
+		if want := basicAuth("x-access-token", "pat-123"); entry.Auth != want {
+			t.Errorf("auth blob: got %q, want %q (base64 user:token)", entry.Auth, want)
+		}
+	})
+
+	// Denied path: the action's grant does not cover the destination, so the
+	// docker credential is skipped (best-effort) — no config.json, no
+	// DOCKER_CONFIG — but the action env build still succeeds and the
+	// registries.conf is still written. A build that never pulls this
+	// registry must not be broken by a destination it didn't request.
+	t.Run("skips_on_broker_denied", func(t *testing.T) {
+		t.Parallel()
+		filesDir := t.TempDir()
+		broker := &fakeBroker{err: ErrBrokerDenied}
+		cs := newControlServer(newCfg(filesDir), newTokenCache(broker, nil), &recordingAudit{}, nil, &tls.Config{MinVersion: tls.VersionTLS12})
+		created := create(t, cs) // still 200: the action env build does not fail
+
+		if v, ok := created.Env["DOCKER_CONFIG"]; ok {
+			t.Errorf("DOCKER_CONFIG must not be set when the docker mint is denied, got %q", v)
+		}
+		// The unconditional registries.conf is still written (it carries no
+		// credential; the proxy injects lazily for podman/buildah).
+		if _, ok := created.Env["CONTAINERS_REGISTRIES_CONF"]; !ok {
+			t.Error("CONTAINERS_REGISTRIES_CONF must still be set even when the docker mint is denied")
+		}
+		actionDir := filepath.Join(filesDir, created.ActionID)
+		if _, err := os.Stat(filepath.Join(actionDir, ".docker", "config.json")); !os.IsNotExist(err) {
+			t.Errorf("config.json must not be written when the docker mint is denied; stat err = %v", err)
+		}
+	})
+
+	// Bearer-scheme docker route (e.g. an Artifactory OIDC token): NOT
+	// written to config.json. A bearer token has no username, so writing it
+	// as a Basic auth blob yields base64(":token"), which docker rejects as
+	// "invalid auth configuration file" and poisons the whole file. Such
+	// routes are served to buildah/podman/skopeo via registries.conf/proxy.
+	t.Run("skips_bearer_scheme", func(t *testing.T) {
+		t.Parallel()
+		filesDir := t.TempDir()
+		broker := &fakeBroker{tok: &MintedToken{
+			Token: "bearer-tok", Scheme: "bearer", Username: "",
+			ExpiresAt: time.Now().Add(time.Hour),
+		}}
+		cs := newControlServer(newCfg(filesDir), newTokenCache(broker, nil), &recordingAudit{}, nil, &tls.Config{MinVersion: tls.VersionTLS12})
+		created := create(t, cs)
+
+		if v, ok := created.Env["DOCKER_CONFIG"]; ok {
+			t.Errorf("DOCKER_CONFIG must not be set for a bearer-scheme docker route, got %q", v)
+		}
+		if _, ok := created.Env["CONTAINERS_REGISTRIES_CONF"]; !ok {
+			t.Error("CONTAINERS_REGISTRIES_CONF must still be set (buildah/podman path)")
+		}
+		actionDir := filepath.Join(filesDir, created.ActionID)
+		if _, err := os.Stat(filepath.Join(actionDir, ".docker", "config.json")); !os.IsNotExist(err) {
+			t.Errorf("config.json must not be written for a bearer-scheme docker route; stat err = %v", err)
+		}
+	})
+
+	// A basic-scheme destination with no configured username still produces
+	// a well-formed auth blob via the fallback username (docker rejects an
+	// empty username).
+	t.Run("fallback_username_when_empty", func(t *testing.T) {
+		t.Parallel()
+		filesDir := t.TempDir()
+		broker := &fakeBroker{tok: &MintedToken{
+			Token: "pat-xyz", Scheme: "basic", Username: "",
+			ExpiresAt: time.Now().Add(time.Hour),
+		}}
+		cs := newControlServer(newCfg(filesDir), newTokenCache(broker, nil), &recordingAudit{}, nil, &tls.Config{MinVersion: tls.VersionTLS12})
+		created := create(t, cs)
+
+		actionDir := filepath.Join(filesDir, created.ActionID)
+		// #nosec G304 -- test-controlled path under t.TempDir().
+		b, err := os.ReadFile(filepath.Join(actionDir, ".docker", "config.json"))
+		if err != nil {
+			t.Fatalf("read docker config.json: %v", err)
+		}
+		var parsed struct {
+			Auths map[string]struct {
+				Auth string `json:"auth"`
+			} `json:"auths"`
+		}
+		if err := json.Unmarshal(b, &parsed); err != nil {
+			t.Fatalf("parse config.json (%s): %v", b, err)
+		}
+		if want := basicAuth(dockerAuthFallbackUsername, "pat-xyz"); parsed.Auths["registry.example.com"].Auth != want {
+			t.Errorf("auth blob: got %q, want %q (fallback username)", parsed.Auths["registry.example.com"].Auth, want)
+		}
+	})
+}
+
 // TestLoopback_CatchAllPlainHTTPProxy confirms that an absolute-form
 // request through the catch-all HTTP_PROXY (a tool not pointed at a
 // per-tool override) is still gated by the host mapping and injected by
