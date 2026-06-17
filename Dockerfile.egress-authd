@@ -19,11 +19,15 @@ COPY . .
 
 ARG TARGETOS
 ARG TARGETARCH
+# Build both binaries: the sidecar daemon AND the docker credential helper.
+# The helper is the at-use path for dockerd (which cannot traverse the loopback
+# proxy); the combined worker image COPYs it out of this image onto PATH so
+# `docker`/`docker compose` can invoke docker-credential-egress-authd.
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags='-s -w' \
-    -o /out/egress-authd ./cmd/egress-authd
+    -o /out/ ./cmd/egress-authd ./cmd/docker-credential-egress-authd
 
 # Runtime stage. distroless/static contains only ca-certificates, the
 # nonroot /etc/passwd entries and tzdata. There is no shell and no
@@ -31,6 +35,8 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 FROM gcr.io/distroless/static-debian12:nonroot
 
 COPY --from=builder /out/egress-authd /usr/local/bin/egress-authd
+# Also ship the credential helper so the combined worker image can COPY it.
+COPY --from=builder /out/docker-credential-egress-authd /usr/local/bin/docker-credential-egress-authd
 
 USER nonroot:nonroot
 ENTRYPOINT ["/usr/local/bin/egress-authd"]
