@@ -49,7 +49,7 @@ func (b *fakeBroker) lastRequest() MintRequest {
 func TestConfig_Validate(t *testing.T) {
 	t.Parallel()
 	base := func() *Config {
-		//nolint:gosec // G101: these are file paths and URLs, not credential literals.
+		//nolint:gosec // G101: file paths and URLs, not credential literals.
 		return &Config{
 			BrokerTokenURL: "https://broker.example.com",
 			ListenSocket:   "/var/run/egress-authd/control.sock",
@@ -57,11 +57,10 @@ func TestConfig_Validate(t *testing.T) {
 			HostDestinationMap: map[string]string{
 				"registry.example.com": "registry",
 			},
-			HostToolMap:     map[string]string{},
 			HostBasePathMap: map[string]string{},
 		}
 	}
-
+	filesDir := "/var/lib/egress-authd/files"
 	tests := []struct {
 		name    string
 		mutate  func(*Config)
@@ -72,110 +71,121 @@ func TestConfig_Validate(t *testing.T) {
 		{name: "explicit mitm mode", mutate: func(c *Config) { c.EgressMode = EgressModeMITM }},
 		{name: "invalid egress mode", mutate: func(c *Config) { c.EgressMode = "transparent" }, wantErr: true},
 		{
-			name: "valid host_tool_map",
-			mutate: func(c *Config) {
-				c.HostToolMap["registry.example.com"] = ToolPyPI
-			},
+			name:   "valid base path",
+			mutate: func(c *Config) { c.HostBasePathMap["registry.example.com"] = "/api/pypi/index/simple" },
 		},
 		{
-			name: "unknown tool tag",
-			mutate: func(c *Config) {
-				c.HostToolMap["registry.example.com"] = "conda"
-			},
+			name:    "base path for unmapped host",
+			mutate:  func(c *Config) { c.HostBasePathMap["nope.example.com"] = "/x" },
 			wantErr: true,
 		},
 		{
-			name: "tool tag for unmapped host",
+			name: "action_env-only route (pypi as config) needs no files dir",
 			mutate: func(c *Config) {
-				c.HostToolMap["mirror.example.com"] = ToolPyPI
-			},
-			wantErr: true,
-		},
-		{
-			name: "valid base path",
-			mutate: func(c *Config) {
-				c.HostBasePathMap["registry.example.com"] = "/api/pypi/index/simple"
-			},
-		},
-		{
-			name: "base path for unmapped host",
-			mutate: func(c *Config) {
-				c.HostBasePathMap["nope.example.com"] = "/x"
-			},
-			wantErr: true,
-		},
-		{
-			name: "multi-tool routes on one host",
-			mutate: func(c *Config) {
-				// A registry serving pypi + cargo + docker: three
-				// routes share the host AND one broker destination, with
-				// distinct loopback prefixes (Destination). Cargo/docker
-				// require action_files_dir to materialise per-tool
-				// helper files.
 				c.HostDestinationMap = nil
-				c.HostToolMap = nil
-				c.HostBasePathMap = nil
-				c.Routes = []Route{
-					{Host: "registry.example.com", Destination: "registry-pypi", BrokerDestination: "registry", Tool: ToolPyPI, BasePath: "/api/pypi/index/simple"},
-					{Host: "registry.example.com", Destination: "registry-cargo", BrokerDestination: "registry", Tool: ToolCargo},
-					{Host: "registry.example.com", Destination: "registry-docker", BrokerDestination: "registry", Tool: ToolDocker},
-				}
-				c.ActionFilesDir = "/var/lib/egress-authd/files"
+				c.Routes = []Route{{
+					Host: "i.example.com", Destination: "reg-pypi", BrokerDestination: "registry",
+					ActionEnv: map[string]string{"PIP_INDEX_URL": "${loopbackRoute}/simple"},
+				}}
 			},
 		},
 		{
-			name: "shared broker_destination across distinct destinations is allowed",
+			name: "action_files route requires action_files_dir",
 			mutate: func(c *Config) {
-				// BrokerDestination repeats ("registry") while Destination
-				// (the loopback prefix) stays unique: this MUST validate, it
-				// is the whole point of the split. Cargo requires
-				// action_files_dir.
 				c.HostDestinationMap = nil
-				c.HostToolMap = nil
-				c.HostBasePathMap = nil
-				c.Routes = []Route{
-					{Host: "a.example.com", Destination: "reg-pypi", BrokerDestination: "registry", Tool: ToolPyPI},
-					{Host: "a.example.com", Destination: "reg-cargo", BrokerDestination: "registry", Tool: ToolCargo},
-				}
-				c.ActionFilesDir = "/var/lib/egress-authd/files"
+				c.Routes = []Route{{
+					Host: "i.example.com", Destination: "reg-cargo", BrokerDestination: "registry",
+					ActionFiles: []ActionFile{{Path: "cargo/config.toml", Template: "registry=\"${loopbackRoute}/\""}},
+				}}
+			},
+			wantErr: true,
+		},
+		{
+			name: "relative action_files_dir rejected",
+			mutate: func(c *Config) {
+				c.HostDestinationMap = nil
+				c.Routes = []Route{{Host: "i.example.com", Destination: "d", BrokerDestination: "registry",
+					ActionFiles: []ActionFile{{Path: "f", Template: "x"}}}}
+				c.ActionFilesDir = "relative/path"
+			},
+			wantErr: true,
+		},
+		{
+			name: "unknown template token rejected",
+			mutate: func(c *Config) {
+				c.Routes = []Route{{Host: "i.example.com", Destination: "d2", BrokerDestination: "registry",
+					ActionEnv: map[string]string{"X": "${nope}"}}}
+			},
+			wantErr: true,
+		},
+		{
+			name: "action_file path escape rejected",
+			mutate: func(c *Config) {
+				c.Routes = []Route{{Host: "i.example.com", Destination: "d3", BrokerDestination: "registry",
+					ActionFiles: []ActionFile{{Path: "../escape", Template: "x"}}}}
+				c.ActionFilesDir = filesDir
+			},
+			wantErr: true,
+		},
+		{
+			name: "disallowed file mode rejected",
+			mutate: func(c *Config) {
+				c.Routes = []Route{{Host: "i.example.com", Destination: "d4", BrokerDestination: "registry",
+					ActionFiles: []ActionFile{{Path: "f", Mode: "0777", Template: "x"}}}}
+				c.ActionFilesDir = filesDir
+			},
+			wantErr: true,
+		},
+		{
+			name: "credential token without gate rejected",
+			mutate: func(c *Config) {
+				c.Routes = []Route{{Host: "i.example.com", Destination: "d5", BrokerDestination: "registry",
+					ActionFiles: []ActionFile{{Path: ".docker/config.json", Template: "${credential.basicAuth}"}}}}
+				c.ActionFilesDir = filesDir
+			},
+			wantErr: true,
+		},
+		{
+			name: "credential token with both gate keys allowed",
+			mutate: func(c *Config) {
+				c.AllowCredentialAtRest = true
+				c.Routes = []Route{{Host: "i.example.com", Destination: "d6", BrokerDestination: "registry",
+					AtRestCredential: true,
+					ActionFiles:      []ActionFile{{Path: ".docker/config.json", Template: "${credential.basicAuth}"}}}}
+				c.ActionFilesDir = filesDir
 			},
 		},
 		{
-			name: "duplicate destination rejected even with distinct broker_destination",
+			name: "credential token with only top-level key rejected",
 			mutate: func(c *Config) {
-				// Destination (loopback prefix) collides; broker destinations
-				// differ. Still rejected: the prefix lookup would be
-				// ambiguous.
+				c.AllowCredentialAtRest = true
+				c.Routes = []Route{{Host: "i.example.com", Destination: "d7", BrokerDestination: "registry",
+					ActionFiles: []ActionFile{{Path: ".docker/config.json", Template: "${credential.basicAuth}"}}}}
+				c.ActionFilesDir = filesDir
+			},
+			wantErr: true,
+		},
+		{
+			name: "shared broker_destination across distinct destinations allowed",
+			mutate: func(c *Config) {
 				c.HostDestinationMap = nil
 				c.Routes = []Route{
-					{Host: "a.example.com", Destination: "dup", BrokerDestination: "registry", Tool: ToolPyPI},
-					{Host: "b.example.com", Destination: "dup", BrokerDestination: "git-host", Tool: ToolGit},
+					{Host: "a.example.com", Destination: "reg-pypi", BrokerDestination: "registry"},
+					{Host: "a.example.com", Destination: "reg-cargo", BrokerDestination: "registry"},
 				}
 			},
-			wantErr: true,
 		},
 		{
-			name: "route missing destination",
+			name: "duplicate destination rejected",
 			mutate: func(c *Config) {
-				c.Routes = []Route{{Host: "x.example.com", Tool: ToolPyPI}}
-			},
-			wantErr: true,
-		},
-		{
-			name: "route unknown tool",
-			mutate: func(c *Config) {
-				c.Routes = []Route{{Host: "x.example.com", Destination: "x", Tool: "conda"}}
-			},
-			wantErr: true,
-		},
-		{
-			name: "duplicate destination across routes",
-			mutate: func(c *Config) {
-				// Same destination on two routes makes the loopback
-				// path-prefix lookup ambiguous; reject it.
 				c.HostDestinationMap = map[string]string{"a.example.com": "dup"}
-				c.Routes = []Route{{Host: "b.example.com", Destination: "dup", Tool: ToolPyPI}}
+				c.Routes = []Route{{Host: "b.example.com", Destination: "dup", BrokerDestination: "registry"}}
 			},
+			wantErr: true,
+		},
+		{
+			name:    "route missing destination",
+			mutate:  func(c *Config) { c.Routes = []Route{{Host: "x.example.com"}} },
 			wantErr: true,
 		},
 		{name: "missing broker token url", mutate: func(c *Config) { c.BrokerTokenURL = "" }, wantErr: true},
@@ -183,56 +193,8 @@ func TestConfig_Validate(t *testing.T) {
 		{name: "missing socket", mutate: func(c *Config) { c.ListenSocket = "" }, wantErr: true},
 		{name: "inverted port range", mutate: func(c *Config) { c.ProxyPortRange = [2]int{200, 100} }, wantErr: true},
 		{name: "port out of range", mutate: func(c *Config) { c.ProxyPortRange = [2]int{1, 70000} }, wantErr: true},
-		{
-			name: "no host mapped at all",
-			mutate: func(c *Config) {
-				c.HostDestinationMap = nil
-				c.Routes = nil
-			},
-			wantErr: true,
-		},
-		{
-			name: "empty destination in map",
-			mutate: func(c *Config) {
-				c.HostDestinationMap["x"] = ""
-			},
-			wantErr: true,
-		},
-		{
-			name: "cargo route without action_files_dir rejected",
-			mutate: func(c *Config) {
-				c.HostDestinationMap = map[string]string{"crates.example.com": "registry-cargo"}
-				c.HostToolMap = map[string]string{"crates.example.com": ToolCargo}
-				c.ActionFilesDir = ""
-			},
-			wantErr: true,
-		},
-		{
-			name: "git route without action_files_dir rejected",
-			mutate: func(c *Config) {
-				c.HostDestinationMap = map[string]string{"git.example.com": "git-host"}
-				c.HostToolMap = map[string]string{"git.example.com": ToolGit}
-				c.ActionFilesDir = ""
-			},
-			wantErr: true,
-		},
-		{
-			name: "relative action_files_dir rejected",
-			mutate: func(c *Config) {
-				c.HostDestinationMap = map[string]string{"git.example.com": "git-host"}
-				c.HostToolMap = map[string]string{"git.example.com": ToolGit}
-				c.ActionFilesDir = "relative/path"
-			},
-			wantErr: true,
-		},
-		{
-			name: "pypi-only does not require action_files_dir",
-			mutate: func(c *Config) {
-				c.HostDestinationMap = map[string]string{"index.example.com": "registry-pypi"}
-				c.HostToolMap = map[string]string{"index.example.com": ToolPyPI}
-				c.ActionFilesDir = ""
-			},
-		},
+		{name: "no host mapped at all", mutate: func(c *Config) { c.HostDestinationMap = nil; c.Routes = nil }, wantErr: true},
+		{name: "empty destination in map", mutate: func(c *Config) { c.HostDestinationMap["x"] = "" }, wantErr: true},
 	}
 	for _, tc := range tests {
 		tc := tc
@@ -271,40 +233,34 @@ func TestConfig_AllowedHostAndDestination(t *testing.T) {
 	}
 }
 
-// TestConfig_MultiToolRoutesResolveDistinctly confirms a host serving
-// several tools yields one upstream per loopback prefix (Destination),
-// each with its own tool tag and base path, all sharing one broker
-// destination, and that the host-level default broker destination is the
-// shared value.
-func TestConfig_MultiToolRoutesResolveDistinctly(t *testing.T) {
+// TestConfig_RoutesResolveDistinctly confirms a host serving several
+// destinations yields one upstream per loopback prefix (Destination), each
+// with its own base path, all sharing one broker destination, and that the
+// host-level default broker destination is the shared value.
+func TestConfig_RoutesResolveDistinctly(t *testing.T) {
 	t.Parallel()
 	c := &Config{
 		Routes: []Route{
-			{Host: "registry.example.com", Destination: "reg-pypi", BrokerDestination: "registry", Tool: ToolPyPI, BasePath: "/api/pypi/pypi/simple"},
-			{Host: "registry.example.com", Destination: "reg-cargo", BrokerDestination: "registry", Tool: ToolCargo, BasePath: "/api/cargo/cargo"},
-			{Host: "registry.example.com", Destination: "reg-docker", BrokerDestination: "registry", Tool: ToolDocker},
+			{Host: "registry.example.com", Destination: "reg-pypi", BrokerDestination: "registry", BasePath: "/api/pypi/pypi/simple"},
+			{Host: "registry.example.com", Destination: "reg-cargo", BrokerDestination: "registry", BasePath: "/api/cargo/cargo"},
+			{Host: "registry.example.com", Destination: "reg-docker", BrokerDestination: "registry"},
 		},
 	}
-
 	if !c.allowedHost("registry.example.com") {
-		t.Fatal("multi-tool host should be allowed")
+		t.Fatal("multi-destination host should be allowed")
 	}
-	// Each loopback prefix resolves to the same host but its own tool/base
-	// path, and all share the one broker destination.
 	pypi, ok := c.upstreamForDestination("reg-pypi")
-	if !ok || pypi.Tool != ToolPyPI || pypi.BasePath != "/api/pypi/pypi/simple" || pypi.BrokerDestination != "registry" {
+	if !ok || pypi.BasePath != "/api/pypi/pypi/simple" || pypi.BrokerDestination != "registry" {
 		t.Errorf("reg-pypi route: got %+v", pypi)
 	}
 	cargo, ok := c.upstreamForDestination("reg-cargo")
-	if !ok || cargo.Tool != ToolCargo || cargo.BasePath != "/api/cargo/cargo" || cargo.BrokerDestination != "registry" {
+	if !ok || cargo.BasePath != "/api/cargo/cargo" || cargo.BrokerDestination != "registry" {
 		t.Errorf("reg-cargo route: got %+v", cargo)
 	}
 	docker, ok := c.upstreamForDestination("reg-docker")
-	if !ok || docker.Tool != ToolDocker || docker.BrokerDestination != "registry" {
+	if !ok || docker.BrokerDestination != "registry" {
 		t.Errorf("reg-docker route: got %+v", docker)
 	}
-	// Host-level default (catch-all path) is the shared broker destination,
-	// not a loopback prefix.
 	if dest, ok := c.destinationForHost("registry.example.com"); !ok || dest != "registry" {
 		t.Errorf("host default broker destination: got (%q,%v), want (registry,true)", dest, ok)
 	}
@@ -321,7 +277,7 @@ func TestConfig_BrokerDestinationDefaultsToDestination(t *testing.T) {
 	t.Parallel()
 	c := &Config{
 		Routes: []Route{
-			{Host: "git.example.com", Destination: "git-host", Tool: ToolGit}, // no broker_destination
+			{Host: "git.example.com", Destination: "git-host"}, // no broker_destination
 		},
 		HostDestinationMap: map[string]string{"pkg.example.com": "registry"},
 	}

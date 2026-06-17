@@ -60,28 +60,6 @@ import (
 // outbound traffic.
 type EgressMode string
 
-// Tool tags name a build tool whose private registry a host serves, so
-// loopback mode can emit that tool's native index/registry override.
-const (
-	ToolPyPI   = "pypi"   // uv / pip simple index
-	ToolCargo  = "cargo"  // cargo registry (source replacement)
-	ToolDocker = "docker" // docker / OCI registry mirror
-	ToolGit    = "git"    // git remote over https
-)
-
-// knownTool reports whether tag is a recognised route tool tag. An
-// empty tag is permitted (a host reachable via the catch-all proxy with
-// no tool-native override); only a non-empty, unrecognised tag is
-// rejected.
-func knownTool(tag string) bool {
-	switch tag {
-	case "", ToolPyPI, ToolCargo, ToolDocker, ToolGit:
-		return true
-	default:
-		return false
-	}
-}
-
 const (
 	// EgressModeLoopback (the default) serves PLAIN HTTP on the
 	// per-action loopback port and reverse-proxies each request to the
@@ -136,15 +114,6 @@ type Config struct {
 	// in neither this map nor Routes is failed closed (not forwarded):
 	// this map (unioned with Routes) is the host allow-list.
 	HostDestinationMap map[string]string `json:"host_destination_map,omitempty"`
-
-	// HostToolMap optionally tags a host in HostDestinationMap with the
-	// build tool whose private registry it serves (pypi, cargo, docker,
-	// git). In loopback mode the tag selects the per-tool index/registry
-	// env overrides (and, for tools that cannot be pointed at a loopback
-	// URL by env alone, the config-file payload). A host with no tag
-	// still gets the generic catch-all proxy and a loopback route; the
-	// tag only adds the tool-native override. Ignored in MITM mode.
-	HostToolMap map[string]string `json:"host_tool_map,omitempty"`
 
 	// HostBasePathMap optionally records, per host in HostDestinationMap,
 	// the base path under which the host's registry lives (for example
@@ -206,6 +175,13 @@ type Config struct {
 	// needs a config file (cargo, docker, git).
 	ActionFilesDir string `json:"action_files_dir"`
 
+	// AllowCredentialAtRest, when false (the default), forbids any route
+	// from materialising a real credential into the action filesystem (a
+	// ${credential.*} token in an action_env/action_files template). It is
+	// the top half of the two-key gate for the at-rest exception; the bottom
+	// half is the per-route AtRestCredential flag.
+	AllowCredentialAtRest bool `json:"allow_credential_at_rest,omitempty"`
+
 	// routesOnce guards the one-time computation of routesCache. The
 	// configuration is immutable after loading, so the merged route list
 	// is built once and reused by every subsequent lookup.
@@ -241,17 +217,39 @@ type Route struct {
 	// case where the loopback prefix and broker destination coincide).
 	BrokerDestination string `json:"broker_destination,omitempty"`
 
-	// Tool optionally tags the route with the build tool whose registry
-	// the host serves (pypi, cargo, docker, git). Selects the per-tool
-	// env override / config-file payload in loopback mode. Empty for a
-	// host reached via the catch-all proxy only.
-	Tool string `json:"tool,omitempty"`
+	// ActionEnv declares environment variables to inject into the action.
+	// Values are templates over the action-wiring token vocabulary
+	// (wiring.go). Generic replacement for the old per-tool env
+	// (PIP_INDEX_URL, CARGO_HOME, DOCKER_CONFIG, ...).
+	ActionEnv map[string]string `json:"action_env,omitempty"`
+
+	// ActionFiles declares per-action config files to materialise (path,
+	// mode, templated content). Generic replacement for the old per-tool
+	// file generators (cargo config.toml, registries.conf, gitconfig,
+	// docker config.json): every tool is now pure config.
+	ActionFiles []ActionFile `json:"action_files,omitempty"`
+
+	// AtRestCredential, with the top-level AllowCredentialAtRest, is the
+	// two-key gate that permits this route's templates to reference a
+	// ${credential.*} token (writing a real secret into the action: the
+	// deprecated-on-arrival at-rest exception). Default false.
+	AtRestCredential bool `json:"at_rest_credential,omitempty"`
 
 	// BasePath optionally records the base path the host's registry
 	// lives under; the loopback reverse-proxy prepends it to the
 	// prefix-stripped request path. Leading slash optional; trailing
 	// slash trimmed.
 	BasePath string `json:"base_path,omitempty"`
+}
+
+// ActionFile is one config file egress-authd materialises into the action.
+// Path is relative to the per-action dir (escapes rejected); Mode is an
+// octal string from a small allowlist (default 0600); Template is rendered
+// over the action-wiring token vocabulary (wiring.go).
+type ActionFile struct {
+	Path     string `json:"path"`
+	Mode     string `json:"mode,omitempty"`
+	Template string `json:"template"`
 }
 
 // Load reads, evaluates and unmarshals the Jsonnet configuration at
@@ -313,18 +311,6 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("host_destination_map[%q]: empty destination is not allowed", host)
 		}
 	}
-	for host, tool := range c.HostToolMap {
-		if host == "" {
-			return fmt.Errorf("host_tool_map: empty host is not allowed")
-		}
-		if !knownTool(tool) {
-			return fmt.Errorf("host_tool_map[%q]: unknown tool %q (recognised: %s, %s, %s, %s)",
-				host, tool, ToolPyPI, ToolCargo, ToolDocker, ToolGit)
-		}
-		if _, ok := c.HostDestinationMap[host]; !ok {
-			return fmt.Errorf("host_tool_map[%q]: host has no host_destination_map entry, so no credential would be injected", host)
-		}
-	}
 	for host := range c.HostBasePathMap {
 		if host == "" {
 			return fmt.Errorf("host_base_path_map: empty host is not allowed")
@@ -339,10 +325,6 @@ func (c *Config) Validate() error {
 		}
 		if rt.Destination == "" {
 			return fmt.Errorf("routes[%d]: destination is required", i)
-		}
-		if !knownTool(rt.Tool) {
-			return fmt.Errorf("routes[%d]: unknown tool %q (recognised: %s, %s, %s, %s)",
-				i, rt.Tool, ToolPyPI, ToolCargo, ToolDocker, ToolGit)
 		}
 	}
 
@@ -372,28 +354,58 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("at least one of host_destination_map or routes must map a host to a destination")
 	}
 
-	// action_files_dir is required whenever any route carries a tool
-	// whose redirection is expressed as a config file (cargo, docker,
-	// git): those payloads are materialised under that directory and
-	// referenced from injected env vars (CARGO_HOME, etc.). A pypi-only
-	// or untagged-host-only deployment does not need it; a deployment
-	// that mixes file-needing tools without it would silently fail to
-	// redirect the action's traffic for those tools, so we fail fast.
-	if c.Mode() == EgressModeLoopback {
-		needsFiles := false
-		for _, du := range c.routes() {
-			switch du.Tool {
-			case ToolCargo, ToolDocker, ToolGit:
-				needsFiles = true
+	// Generic action-wiring validation + the at-rest credential gate.
+	valVars := validationVars()
+	anyFiles := false
+	for i, du := range c.routes() {
+		credInTemplates := false
+		for k, v := range du.ActionEnv {
+			if k == "" {
+				return fmt.Errorf("routes[%d] (destination %q): empty action_env key", i, du.Destination)
+			}
+			if _, err := renderTemplate(v, valVars); err != nil {
+				return fmt.Errorf("routes[%d] action_env[%q]: %w", i, k, err)
+			}
+			if referencesCredential(v) {
+				credInTemplates = true
 			}
 		}
-		if needsFiles {
-			if c.ActionFilesDir == "" {
-				return fmt.Errorf("action_files_dir is required when any route carries a tool that needs a config file (cargo, docker, git)")
+		seenPath := map[string]bool{}
+		for j, f := range du.ActionFiles {
+			anyFiles = true
+			if _, err := cleanActionPath("/probe", f.Path); err != nil {
+				return fmt.Errorf("routes[%d] action_files[%d]: %w", i, j, err)
 			}
-			if !filepath.IsAbs(c.ActionFilesDir) {
-				return fmt.Errorf("action_files_dir must be an absolute path, got %q", c.ActionFilesDir)
+			cp := filepath.Clean(f.Path)
+			if seenPath[cp] {
+				return fmt.Errorf("routes[%d] action_files[%d]: duplicate path %q", i, j, f.Path)
 			}
+			seenPath[cp] = true
+			if _, err := parseFileMode(f.Mode); err != nil {
+				return fmt.Errorf("routes[%d] action_files[%d]: %w", i, j, err)
+			}
+			if _, err := renderTemplate(f.Template, valVars); err != nil {
+				return fmt.Errorf("routes[%d] action_files[%d] (%q): %w", i, j, f.Path, err)
+			}
+			if referencesCredential(f.Template, f.Path) {
+				credInTemplates = true
+			}
+		}
+		// Two-key gate: a ${credential.*} token writes a secret into the
+		// action's filesystem and is refused unless BOTH allow_credential_at_rest
+		// and the route's at_rest_credential are set.
+		if credInTemplates && (!c.AllowCredentialAtRest || !du.AtRestCredential) {
+			return fmt.Errorf("routes[%d] (destination %q): a ${credential.*} token writes a secret into the action; set top-level allow_credential_at_rest=true AND the route at_rest_credential=true to permit it", i, du.Destination)
+		}
+	}
+
+	// action_files_dir is required whenever any route declares files.
+	if c.Mode() == EgressModeLoopback && anyFiles {
+		if c.ActionFilesDir == "" {
+			return fmt.Errorf("action_files_dir is required when any route declares action_files")
+		}
+		if !filepath.IsAbs(c.ActionFilesDir) {
+			return fmt.Errorf("action_files_dir must be an absolute path, got %q", c.ActionFilesDir)
 		}
 	}
 	return nil
@@ -430,8 +442,10 @@ func (c *Config) computeRoutes() []destinationUpstream {
 			Destination:       rt.Destination,
 			BrokerDestination: brokerDest,
 			Host:              rt.Host,
-			Tool:              rt.Tool,
 			BasePath:          normalizeBasePath(rt.BasePath),
+			ActionEnv:         rt.ActionEnv,
+			ActionFiles:       rt.ActionFiles,
+			AtRestCredential:  rt.AtRestCredential,
 		})
 	}
 	for _, host := range sortedKeys(c.HostDestinationMap) {
@@ -442,7 +456,6 @@ func (c *Config) computeRoutes() []destinationUpstream {
 			Destination:       dest,
 			BrokerDestination: dest,
 			Host:              host,
-			Tool:              c.HostToolMap[host],
 			BasePath:          normalizeBasePath(c.HostBasePathMap[host]),
 		})
 	}
@@ -535,8 +548,10 @@ type destinationUpstream struct {
 	Destination       string
 	BrokerDestination string
 	Host              string
-	Tool              string // "" when the route carries no tool tag
 	BasePath          string // "" (host root) or a leading-slash, no-trailing-slash path
+	ActionEnv         map[string]string
+	ActionFiles       []ActionFile
+	AtRestCredential  bool
 }
 
 // sortedKeys returns the keys of m in ascending order for deterministic

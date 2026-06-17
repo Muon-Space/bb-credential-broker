@@ -77,7 +77,6 @@ func TestLoopback_BasePathContainment(t *testing.T) {
 
 	cfg := &Config{
 		HostDestinationMap: map[string]string{host: "registry-pypi"},
-		HostToolMap:        map[string]string{host: ToolPyPI},
 		// The registry's package-repo ROOT. The loopback URL embeds it
 		// after the destination segment (mirroring the upstream path so
 		// upstream-emitted relative links resolve inside the destination
@@ -149,8 +148,8 @@ func TestLoopback_SharedBrokerDestinationMintsOnceAndUsesBrokerDestination(t *te
 
 	cfg := &Config{
 		Routes: []Route{
-			{Host: host, Destination: "registry-pypi", BrokerDestination: "registry", Tool: ToolPyPI},
-			{Host: host, Destination: "registry-cargo", BrokerDestination: "registry", Tool: ToolCargo},
+			{Host: host, Destination: "registry-pypi", BrokerDestination: "registry"},
+			{Host: host, Destination: "registry-cargo", BrokerDestination: "registry"},
 		},
 	}
 	action := &Action{ID: "a", Grant: "grant-1", ExpiresAt: time.Now().Add(time.Hour)}
@@ -274,83 +273,79 @@ func TestLoopback_BrokerDeniedFailsClosedForbidden(t *testing.T) {
 }
 
 // TestLoopback_ControlEnvReturnsLoopbackURLs drives the control API in
-// loopback mode and asserts the returned env points the pip/uv tools at
-// the per-destination loopback route, sets the catch-all proxy, and
-// drops the MITM CA PEM.
+// loopback mode and asserts a route's action_env templates render against the
+// per-action loopback route, the catch-all proxy is set, and the MITM CA PEM
+// is dropped.
 func TestLoopback_ControlEnvReturnsLoopbackURLs(t *testing.T) {
 	t.Parallel()
 	cfg := &Config{
-		EgressMode:         EgressModeLoopback,
-		ProxyPortRange:     [2]int{21000, 21200},
-		HostDestinationMap: map[string]string{"registry.example.com": "registry-pypi"},
-		HostToolMap:        map[string]string{"registry.example.com": ToolPyPI},
+		EgressMode:     EgressModeLoopback,
+		ProxyPortRange: [2]int{21000, 21200},
+		Routes: []Route{{
+			Host: "registry.example.com", Destination: "registry-pypi", BrokerDestination: "registry",
+			ActionEnv: map[string]string{
+				"UV_DEFAULT_INDEX":    "${loopbackRoute}/simple",
+				"UV_INDEX":            "${loopbackRoute}/simple",
+				"PIP_INDEX_URL":       "${loopbackRoute}/simple",
+				"PIP_EXTRA_INDEX_URL": "${loopbackRoute}/simple",
+			},
+		}},
 	}
 	broker := &fakeBroker{tok: &MintedToken{Token: "t", Scheme: "bearer", ExpiresAt: time.Now().Add(time.Hour)}}
 	cs := newControlServer(cfg, newTokenCache(broker, nil), &recordingAudit{}, nil, &tls.Config{MinVersion: tls.VersionTLS12})
-	handler := cs.Handler()
 
-	createBody, _ := json.Marshal(createActionRequest{
-		Grant:     "grant-1",
-		ExpiresAt: time.Now().Add(time.Hour).Format(time.RFC3339),
-	})
-	rec := doRequest(t, handler, http.MethodPost, "/actions", createBody)
+	createBody, _ := json.Marshal(createActionRequest{Grant: "grant-1", ExpiresAt: time.Now().Add(time.Hour).Format(time.RFC3339)})
+	rec := doRequest(t, cs.Handler(), http.MethodPost, "/actions", createBody)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("POST /actions: got %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+		t.Fatalf("POST /actions: got %d (body=%s)", rec.Code, rec.Body.String())
 	}
 	var created createActionResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
-		t.Fatalf("decode create response: %v", err)
+		t.Fatalf("decode: %v", err)
 	}
 
 	base := fmt.Sprintf("http://127.0.0.1:%d", created.ProxyPort)
-	// The route embeds the (empty, here) base path; the PEP 503 simple
-	// index lives under it.
 	wantIndex := base + "/registry-pypi/simple"
-
-	// Catch-all proxy points at the loopback base.
 	if created.Env["HTTP_PROXY"] != base || created.Env["HTTPS_PROXY"] != base {
-		t.Errorf("catch-all proxy: got HTTP_PROXY=%q HTTPS_PROXY=%q, want %q",
-			created.Env["HTTP_PROXY"], created.Env["HTTPS_PROXY"], base)
+		t.Errorf("catch-all proxy: got HTTP_PROXY=%q HTTPS_PROXY=%q, want %q", created.Env["HTTP_PROXY"], created.Env["HTTPS_PROXY"], base)
 	}
-	// Per-tool index overrides point at the per-destination simple index.
 	for _, key := range []string{"UV_DEFAULT_INDEX", "UV_INDEX", "PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL"} {
 		if created.Env[key] != wantIndex {
 			t.Errorf("%s: got %q, want %q", key, created.Env[key], wantIndex)
 		}
 	}
-	// The MITM CA PEM must be absent in loopback mode.
 	if _, ok := created.Env["EGRESS_AUTHD_CA_PEM"]; ok {
 		t.Error("EGRESS_AUTHD_CA_PEM must not be set in loopback mode")
 	}
-	// Pypi is env-only — no helper files for this route.
-	for _, key := range []string{"CARGO_HOME", "CONTAINERS_REGISTRIES_CONF", "GIT_CONFIG_GLOBAL"} {
-		if v, ok := created.Env[key]; ok {
-			t.Errorf("%s must not be set for pypi-only mapping, got %q", key, v)
-		}
-	}
 }
 
-// TestLoopback_ActionFilesDir_MaterialisesAndCleansUp asserts that
-// cargo, docker and git tags cause the sidecar to materialise per-tool
-// config files under <ActionFilesDir>/<action_id>/, emit env vars
-// pointing at those paths, and remove the per-action directory on
-// DELETE /actions/{id}. Pypi stays env-only.
-func TestLoopback_ActionFilesDir_MaterialisesAndCleansUp(t *testing.T) {
+// TestLoopback_ActionFiles_RenderMaterialiseCleanup drives the control API
+// with the build tools expressed PURELY as config (action_env + action_files)
+// -- proving the generic primitive reproduces the old per-tool wiring with
+// zero tool-specific Go. It asserts each file renders against the loopback
+// token vocabulary, env points into the per-action dir, and the dir is removed
+// on DELETE.
+func TestLoopback_ActionFiles_RenderMaterialiseCleanup(t *testing.T) {
 	t.Parallel()
 	filesDir := t.TempDir()
 	cfg := &Config{
 		EgressMode:     EgressModeLoopback,
 		ActionFilesDir: filesDir,
 		ProxyPortRange: [2]int{21300, 21500},
-		HostDestinationMap: map[string]string{
-			"cargo.example.com":    "registry-cargo",
-			"registry.example.com": "registry-docker",
-			"git.example.com":      "git-host",
-		},
-		HostToolMap: map[string]string{
-			"cargo.example.com":    ToolCargo,
-			"registry.example.com": ToolDocker,
-			"git.example.com":      ToolGit,
+		Routes: []Route{
+			{Host: "cargo.example.com", Destination: "registry-cargo", BrokerDestination: "registry",
+				ActionEnv:   map[string]string{"CARGO_HOME": "${actionDir}/cargo"},
+				ActionFiles: []ActionFile{{Path: "cargo/config.toml", Template: "[source.crates-io]\nreplace-with=\"egress-authd\"\n[source.egress-authd]\nregistry=\"sparse+${loopbackRoute}/\"\n"}}},
+			{Host: "git.example.com", Destination: "git-host", BrokerDestination: "git-host",
+				ActionEnv:   map[string]string{"GIT_CONFIG_GLOBAL": "${actionDir}/gitconfig"},
+				ActionFiles: []ActionFile{{Path: "gitconfig", Template: "[url \"${loopbackRoute}/\"]\n\tinsteadOf=\"https://${host}/\"\n"}}},
+			{Host: "registry.example.com", Destination: "registry-docker", BrokerDestination: "ghe-containers",
+				ActionEnv: map[string]string{
+					"DOCKER_CONFIG":               "${actionDir}/.docker",
+					"EGRESS_AUTHD_ACTION_ID":      "${actionID}",
+					"EGRESS_AUTHD_CONTROL_SOCKET": "${controlSocket}",
+				},
+				ActionFiles: []ActionFile{{Path: ".docker/config.json", Template: "{\"credHelpers\":{\"${host}\":\"egress-authd\"}}"}}},
 		},
 	}
 	broker := &fakeBroker{tok: &MintedToken{Token: "t", Scheme: "bearer", ExpiresAt: time.Now().Add(time.Hour)}}
@@ -367,67 +362,170 @@ func TestLoopback_ActionFilesDir_MaterialisesAndCleansUp(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 
-	actionDir := filepath.Join(filesDir, created.ActionID)
-	info, err := os.Stat(actionDir)
-	if err != nil {
-		t.Fatalf("per-action dir not created at %s: %v", actionDir, err)
-	}
-	if !info.IsDir() {
-		t.Fatalf("%s is not a directory", actionDir)
-	}
-	if got := info.Mode().Perm(); got != 0o700 {
-		t.Errorf("per-action dir mode: got %o, want 0700 (cross-action isolation)", got)
+	// No route references ${credential.*}, so NO broker mint at env build.
+	if n := broker.callCount(); n != 0 {
+		t.Errorf("broker called %d times at env-build; credential-free routes must not mint", n)
 	}
 
-	// Each tool's env var must point at a file under the action dir, and
-	// that file's contents must match the per-tool generator.
+	actionDir := filepath.Join(filesDir, created.ActionID)
+	if info, err := os.Stat(actionDir); err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
+		t.Fatalf("per-action dir: err=%v info=%v", err, info)
+	}
 	cases := []struct {
-		envKey       string
-		wantPathSub  string
-		wantContents []string
+		envKey, rel string
+		want        []string
 	}{
-		{"CARGO_HOME", "/cargo", []string{"replace-with", "/registry-cargo"}},
-		{"CONTAINERS_REGISTRIES_CONF", "/registries.conf", []string{"registry.example.com", "/registry-docker"}},
-		{"GIT_CONFIG_GLOBAL", "/gitconfig", []string{"insteadOf", "https://git.example.com/"}},
+		{"CARGO_HOME", "cargo/config.toml", []string{"replace-with", "registry-cargo", "egress-authd"}},
+		{"GIT_CONFIG_GLOBAL", "gitconfig", []string{"insteadOf", "https://git.example.com/"}},
+		{"DOCKER_CONFIG", ".docker/config.json", []string{"credHelpers", "registry.example.com", "egress-authd"}},
 	}
 	for _, c := range cases {
-		envVal, ok := created.Env[c.envKey]
-		if !ok {
-			t.Errorf("%s env var was not emitted; env=%v", c.envKey, created.Env)
-			continue
+		if _, ok := created.Env[c.envKey]; !ok {
+			t.Errorf("%s not emitted; env=%v", c.envKey, created.Env)
 		}
-		if !strings.HasPrefix(envVal, actionDir) {
-			t.Errorf("%s=%q does not live under the per-action dir %s", c.envKey, envVal, actionDir)
-		}
-		// CARGO_HOME points at a directory; the file we wrote is
-		// $CARGO_HOME/config.toml.
-		filePath := envVal
-		if c.envKey == "CARGO_HOME" {
-			filePath = filepath.Join(envVal, "config.toml")
-		}
-		// #nosec G304 -- test-controlled path: filePath is derived from
-		// the env value the sidecar just emitted into t.TempDir(); the
-		// whole point of the test is to read what it wrote.
-		b, err := os.ReadFile(filePath)
+		// #nosec G304 -- test-controlled path under t.TempDir().
+		b, err := os.ReadFile(filepath.Join(actionDir, c.rel))
 		if err != nil {
-			t.Errorf("read %s contents at %s: %v", c.envKey, filePath, err)
+			t.Errorf("read %s: %v", c.rel, err)
 			continue
 		}
-		for _, sub := range c.wantContents {
-			if !strings.Contains(string(b), sub) {
-				t.Errorf("%s file at %s does not contain %q; got:\n%s", c.envKey, filePath, sub, b)
+		for _, sub := range c.want {
+			if sub != "" && !strings.Contains(string(b), sub) {
+				t.Errorf("%s does not contain %q; got:\n%s", c.rel, sub, b)
 			}
 		}
 	}
+	// The rendered cargo file must NOT still contain the literal token.
+	// #nosec G304
+	cargoBytes, _ := os.ReadFile(filepath.Join(actionDir, "cargo/config.toml"))
+	if strings.Contains(string(cargoBytes), "${loopbackRoute}") {
+		t.Errorf("cargo config.toml still contains an unrendered token: %s", cargoBytes)
+	}
+	// docker config.json carries NO secret (credHelpers pointer only).
+	// #nosec G304
+	dj, _ := os.ReadFile(filepath.Join(actionDir, ".docker/config.json"))
+	if strings.Contains(string(dj), "\"auth\"") {
+		t.Errorf("docker config.json must not contain an auths secret; got %s", dj)
+	}
+	if created.Env["EGRESS_AUTHD_ACTION_ID"] != created.ActionID {
+		t.Errorf("EGRESS_AUTHD_ACTION_ID: got %q want %q", created.Env["EGRESS_AUTHD_ACTION_ID"], created.ActionID)
+	}
 
-	// DELETE removes the per-action dir.
 	rec = doRequest(t, handler, http.MethodDelete, "/actions/"+created.ActionID, nil)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("DELETE /actions/%s: got %d (body=%s)", created.ActionID, rec.Code, rec.Body.String())
+		t.Fatalf("DELETE: got %d", rec.Code)
 	}
 	if _, err := os.Stat(actionDir); !os.IsNotExist(err) {
-		t.Errorf("per-action dir was not removed on DELETE: stat err = %v", err)
+		t.Errorf("per-action dir not removed on DELETE: %v", err)
 	}
+}
+
+// TestLoopback_CredentialTokenMintsAndWritesAtRest exercises the gated at-rest
+// exception: a route whose action_file references ${credential.*} mints from
+// the broker at env-build time and writes the secret into the file.
+func TestLoopback_CredentialTokenMintsAndWritesAtRest(t *testing.T) {
+	t.Parallel()
+	filesDir := t.TempDir()
+	cfg := &Config{
+		EgressMode:            EgressModeLoopback,
+		ActionFilesDir:        filesDir,
+		ProxyPortRange:        [2]int{21550, 21650},
+		AllowCredentialAtRest: true,
+		Routes: []Route{{
+			Host: "registry.example.com", Destination: "reg-docker", BrokerDestination: "ghe-containers",
+			AtRestCredential: true,
+			ActionEnv:        map[string]string{"DOCKER_CONFIG": "${actionDir}/.docker"},
+			ActionFiles:      []ActionFile{{Path: ".docker/config.json", Mode: "0600", Template: "{\"auths\":{\"${host}\":{\"auth\":\"${credential.basicAuth}\"}}}"}},
+		}},
+	}
+	broker := &fakeBroker{tok: &MintedToken{Token: "pat-123", Scheme: "basic", Username: "svc", ExpiresAt: time.Now().Add(time.Hour)}}
+	cs := newControlServer(cfg, newTokenCache(broker, nil), &recordingAudit{}, nil, &tls.Config{MinVersion: tls.VersionTLS12})
+	createBody, _ := json.Marshal(createActionRequest{Grant: "g"})
+	rec := doRequest(t, cs.Handler(), http.MethodPost, "/actions", createBody)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST /actions: got %d (body=%s)", rec.Code, rec.Body.String())
+	}
+	var created createActionResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &created)
+	if broker.callCount() != 1 {
+		t.Errorf("credential-bearing route should mint once at env build; got %d", broker.callCount())
+	}
+	actionDir := filepath.Join(filesDir, created.ActionID)
+	// #nosec G304
+	b, err := os.ReadFile(filepath.Join(actionDir, ".docker/config.json"))
+	if err != nil {
+		t.Fatalf("read config.json: %v", err)
+	}
+	if want := basicAuth("svc", "pat-123"); !strings.Contains(string(b), want) {
+		t.Errorf("config.json missing minted auth %q; got %s", want, b)
+	}
+}
+
+// TestControl_CredentialEndpoint exercises the at-use credential endpoint a
+// native credential helper (docker, git, ...) calls per pull.
+func TestControl_CredentialEndpoint(t *testing.T) {
+	t.Parallel()
+	cfg := &Config{
+		EgressMode:     EgressModeLoopback,
+		ActionFilesDir: t.TempDir(),
+		ProxyPortRange: [2]int{22000, 22200},
+		Routes: []Route{{
+			Host: "registry.example.com", Destination: "reg-docker", BrokerDestination: "ghe-containers",
+			ActionEnv:   map[string]string{"DOCKER_CONFIG": "${actionDir}/.docker"},
+			ActionFiles: []ActionFile{{Path: ".docker/config.json", Template: "{\"credHelpers\":{\"${host}\":\"egress-authd\"}}"}},
+		}},
+	}
+	newCS := func(broker BrokerClient) (http.Handler, string) {
+		cs := newControlServer(cfg, newTokenCache(broker, nil), &recordingAudit{}, nil, &tls.Config{MinVersion: tls.VersionTLS12})
+		h := cs.Handler()
+		createBody, _ := json.Marshal(createActionRequest{Grant: "g"})
+		rec := doRequest(t, h, http.MethodPost, "/actions", createBody)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("POST /actions: got %d", rec.Code)
+		}
+		var created createActionResponse
+		_ = json.Unmarshal(rec.Body.Bytes(), &created)
+		return h, created.ActionID
+	}
+
+	t.Run("success", func(t *testing.T) {
+		t.Parallel()
+		broker := &fakeBroker{tok: &MintedToken{Token: "pat-123", Scheme: "basic", Username: "svc", ExpiresAt: time.Now().Add(time.Hour)}}
+		h, id := newCS(broker)
+		rec := doRequest(t, h, http.MethodGet, "/actions/"+id+"/credential?host=registry.example.com", nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET credential: got %d (body=%s)", rec.Code, rec.Body.String())
+		}
+		var cred credentialResponse
+		_ = json.Unmarshal(rec.Body.Bytes(), &cred)
+		if cred.Token != "pat-123" || cred.Scheme != "basic" || cred.Username != "svc" {
+			t.Errorf("credential: got %+v", cred)
+		}
+	})
+	t.Run("unknown_action", func(t *testing.T) {
+		t.Parallel()
+		h, _ := newCS(&fakeBroker{tok: &MintedToken{Token: "t", ExpiresAt: time.Now().Add(time.Hour)}})
+		rec := doRequest(t, h, http.MethodGet, "/actions/nope/credential?host=registry.example.com", nil)
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("unknown action: got %d, want 404", rec.Code)
+		}
+	})
+	t.Run("unmapped_host", func(t *testing.T) {
+		t.Parallel()
+		h, id := newCS(&fakeBroker{tok: &MintedToken{Token: "t", ExpiresAt: time.Now().Add(time.Hour)}})
+		rec := doRequest(t, h, http.MethodGet, "/actions/"+id+"/credential?host=evil.example.com", nil)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("unmapped host: got %d, want 403", rec.Code)
+		}
+	})
+	t.Run("broker_denied", func(t *testing.T) {
+		t.Parallel()
+		h, id := newCS(&fakeBroker{err: ErrBrokerDenied})
+		rec := doRequest(t, h, http.MethodGet, "/actions/"+id+"/credential?host=registry.example.com", nil)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("broker denied: got %d, want 403", rec.Code)
+		}
+	})
 }
 
 // TestLoopback_CatchAllPlainHTTPProxy confirms that an absolute-form

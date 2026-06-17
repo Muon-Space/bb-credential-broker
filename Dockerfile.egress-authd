@@ -19,11 +19,22 @@ COPY . .
 
 ARG TARGETOS
 ARG TARGETARCH
+# Build both binaries: the sidecar daemon AND the tool-agnostic credential
+# adapter. The adapter is the at-use path for dockerd/git (which cannot
+# traverse the loopback proxy); the combined worker image COPYs it out of this
+# image onto PATH so `docker`/`docker compose`/`git` can invoke
+# docker-credential-egress-authd / git-credential-egress-authd.
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags='-s -w' \
-    -o /out/egress-authd ./cmd/egress-authd
+    -o /out/ ./cmd/egress-authd ./cmd/egress-authd-cred
+
+# argv0 adapters: HARD links (NOT symlinks) so a downstream cross-image COPY
+# yields a complete executable, not a dangling link. The adapter dispatches on
+# filepath.Base(os.Args[0]), so each name selects its protocol.
+RUN ln /out/egress-authd-cred /out/docker-credential-egress-authd \
+ && ln /out/egress-authd-cred /out/git-credential-egress-authd
 
 # Runtime stage. distroless/static contains only ca-certificates, the
 # nonroot /etc/passwd entries and tzdata. There is no shell and no
@@ -31,6 +42,13 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 FROM gcr.io/distroless/static-debian12:nonroot
 
 COPY --from=builder /out/egress-authd /usr/local/bin/egress-authd
+# Ship the credential adapter under all three argv0 names so the combined
+# worker image can COPY any of them. Each COPY of a hard link copies full
+# content, yielding three independent working binaries (distroless has no
+# shell, so the linking must happen in the builder stage above).
+COPY --from=builder /out/egress-authd-cred /usr/local/bin/egress-authd-cred
+COPY --from=builder /out/docker-credential-egress-authd /usr/local/bin/docker-credential-egress-authd
+COPY --from=builder /out/git-credential-egress-authd /usr/local/bin/git-credential-egress-authd
 
 USER nonroot:nonroot
 ENTRYPOINT ["/usr/local/bin/egress-authd"]

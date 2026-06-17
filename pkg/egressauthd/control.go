@@ -1,10 +1,12 @@
 package egressauthd
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -132,7 +134,7 @@ func (cs *controlServer) handleActions(w http.ResponseWriter, r *http.Request) {
 	// tears down the proxy and surfaces the error to the caller (the
 	// worker) rather than leaving a half-registered action whose env
 	// points at a non-existent dir.
-	env, err := cs.actionEnv(action, proxy)
+	env, err := cs.actionEnv(r.Context(), action, proxy)
 	if err != nil {
 		proxy.Close()
 		cs.mu.Lock()
@@ -155,20 +157,91 @@ func (cs *controlServer) handleActions(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleActionByID serves DELETE /actions/{action_id}.
+// handleActionByID serves DELETE /actions/{action_id} and
+// GET /actions/{action_id}/credential.
 func (cs *controlServer) handleActionByID(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodDelete {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	rest := strings.TrimPrefix(r.URL.Path, "/actions/")
+	if rest == "" {
+		http.Error(w, "action_id is required", http.StatusBadRequest)
 		return
 	}
-	id := strings.TrimPrefix(r.URL.Path, "/actions/")
-	if id == "" || strings.Contains(id, "/") {
-		http.Error(w, "action_id is required", http.StatusBadRequest)
+	// GET /actions/{id}/credential?host=<host>
+	if id, ok := strings.CutSuffix(rest, "/credential"); ok {
+		if id == "" || strings.Contains(id, "/") {
+			http.Error(w, "action_id is required", http.StatusBadRequest)
+			return
+		}
+		cs.handleCredential(w, r, id)
+		return
+	}
+	// DELETE /actions/{id}
+	id := rest
+	if strings.Contains(id, "/") {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	cs.registry.Delete(id) // teardown happens via the eviction hook
 	cs.metrics.SetActiveActions(len(cs.registry.snapshot()))
 	w.WriteHeader(http.StatusOK)
+}
+
+// credentialResponse is the JSON body GET /actions/{id}/credential returns:
+// the broker-minted credential for the requested host, projected to the
+// fields the docker credential helper needs.
+type credentialResponse struct {
+	Scheme   string `json:"scheme"`
+	Username string `json:"username"`
+	Token    string `json:"token"`
+}
+
+// handleCredential serves GET /actions/{id}/credential?host=<host>. It is
+// the lazy, at-use credential path for the docker tool: dockerd cannot
+// traverse the per-action loopback proxy, so the
+// docker-credential-egress-authd helper (running inside the action) calls
+// this per pull to fetch the broker credential, rather than a secret being
+// materialised onto the action's disk. It resolves the broker destination
+// mapped to host, mints (or reuses) the credential for the action's grant,
+// and returns it. Fail-closed: an unknown/expired action, an unmapped host,
+// or a broker denial/error all return non-2xx so the helper exits non-zero
+// and the docker pull fails closed.
+func (cs *controlServer) handleCredential(w http.ResponseWriter, r *http.Request, actionID string) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	host := hostnameOnly(r.URL.Query().Get("host"))
+	if host == "" {
+		http.Error(w, "host query parameter is required", http.StatusBadRequest)
+		return
+	}
+	action, ok := cs.registry.Get(actionID)
+	if !ok {
+		http.Error(w, "unknown or expired action", http.StatusNotFound)
+		return
+	}
+	dest, ok := cs.cfg.destinationForHost(host)
+	if !ok {
+		http.Error(w, "host not permitted", http.StatusForbidden)
+		return
+	}
+	tok, err := cs.cache.Get(r.Context(), action, dest)
+	if err != nil {
+		if errors.Is(err, ErrBrokerDenied) {
+			http.Error(w, "broker denied destination", http.StatusForbidden)
+			return
+		}
+		http.Error(w, "broker mint failed: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, http.StatusOK, credentialResponse{
+		Scheme:   tok.Scheme,
+		Username: tok.Username,
+		Token:    tok.Token,
+	})
 }
 
 // actionEnv builds the environment variables the worker injects into
@@ -178,9 +251,9 @@ func (cs *controlServer) handleActionByID(w http.ResponseWriter, r *http.Request
 // The env shape depends on the configured egress mode and the
 // sidecar's route table; the per-action directory and file contents
 // are otherwise identical across actions of one sidecar.
-func (cs *controlServer) actionEnv(action *Action, proxy *actionProxy) (map[string]string, error) {
+func (cs *controlServer) actionEnv(ctx context.Context, action *Action, proxy *actionProxy) (map[string]string, error) {
 	if cs.cfg.Mode() == EgressModeLoopback {
-		return cs.loopbackActionEnv(action)
+		return cs.loopbackActionEnv(ctx, action)
 	}
 	return cs.mitmActionEnv(action.ProxyPort, proxy), nil
 }
@@ -223,7 +296,7 @@ func (cs *controlServer) mitmActionEnv(port int, proxy *actionProxy) map[string]
 // (the action_id itself is 128 bits of base64-URL entropy, so guessing
 // is infeasible; 0700 is defence-in-depth). Cleanup is bound to the
 // action lifecycle in teardownAction.
-func (cs *controlServer) loopbackActionEnv(action *Action) (map[string]string, error) {
+func (cs *controlServer) loopbackActionEnv(ctx context.Context, action *Action) (map[string]string, error) {
 	base := fmt.Sprintf("http://127.0.0.1:%d", action.ProxyPort)
 	env := map[string]string{
 		// Catch-all so any tool that honours the proxy env reaches a
@@ -238,100 +311,127 @@ func (cs *controlServer) loopbackActionEnv(action *Action) (map[string]string, e
 		"no_proxy":    cs.noProxy(),
 	}
 
-	// Lazy: only allocate the per-action dir the first time a route
-	// produces a file. A pypi-only or untagged-host-only deployment
-	// touches the filesystem zero times.
-	var actionDir string
+	// The per-action dir is created lazily on the first file write, but its
+	// PATH is known up front so ${actionDir} resolves in env values even for a
+	// route that declares no files.
+	var actionDirPath string
+	if cs.cfg.ActionFilesDir != "" {
+		actionDirPath = filepath.Join(cs.cfg.ActionFilesDir, action.ID)
+	}
+	dirCreated := false
 	ensureDir := func() error {
-		if actionDir != "" {
+		if dirCreated {
 			return nil
 		}
-		if cs.cfg.ActionFilesDir == "" {
-			// Config.Validate prevents this at startup whenever a
-			// file-needing route is present; defensive guard.
-			return fmt.Errorf("action_files_dir is not configured but a route requires per-action helper files")
+		if actionDirPath == "" {
+			return fmt.Errorf("action_files_dir is not configured but a route declares action_files")
 		}
-		dir := filepath.Join(cs.cfg.ActionFilesDir, action.ID)
-		if err := os.MkdirAll(dir, 0o700); err != nil {
+		if err := os.MkdirAll(actionDirPath, 0o700); err != nil {
 			return fmt.Errorf("create per-action helper dir: %w", err)
 		}
-		actionDir = dir
+		dirCreated = true
 		return nil
 	}
-	writeFile := func(name, contents string) error {
+	writeActionFile := func(relPath, contents string, mode uint32) error {
+		full, err := cleanActionPath(actionDirPath, relPath)
+		if err != nil {
+			return err
+		}
 		if err := ensureDir(); err != nil {
 			return err
 		}
-		path := filepath.Join(actionDir, name)
-		if d := filepath.Dir(path); d != actionDir {
+		if d := filepath.Dir(full); d != actionDirPath {
 			if err := os.MkdirAll(d, 0o700); err != nil {
 				return fmt.Errorf("create per-action helper subdir: %w", err)
 			}
 		}
-		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
-			return fmt.Errorf("write %s: %w", name, err)
+		// O_EXCL: a duplicate target is a config error (Validate dedups; this
+		// is defence-in-depth). O_NOFOLLOW: never write through a symlink.
+		// #nosec G304 -- full is cleanActionPath-sanitized (above) and opened
+		// O_EXCL|O_NOFOLLOW under a per-action 0700 dir.
+		f, err := os.OpenFile(full, os.O_CREATE|os.O_EXCL|os.O_WRONLY|extraOpenFlags(), os.FileMode(mode))
+		if err != nil {
+			return fmt.Errorf("write %s: %w", relPath, err)
+		}
+		defer func() { _ = f.Close() }()
+		if _, err := f.WriteString(contents); err != nil {
+			return fmt.Errorf("write %s: %w", relPath, err)
 		}
 		return nil
 	}
 
 	for _, du := range cs.cfg.mappedUpstreams() {
-		// The per-destination loopback URL mirrors the upstream path:
-		// http://127.0.0.1:<port>/<dest><base-path>. Embedding the base
-		// path in the URL the tool is pointed at (rather than prepending
-		// it in the reverse-proxy) keeps the loopback path depth equal to
-		// the upstream path depth, so RELATIVE links emitted by the
-		// upstream (computed against its real path) resolve to URLs that
-		// stay inside the destination namespace. The reverse-proxy
-		// enforces the base path as a containment subtree (403 outside).
+		// SAFE token vocabulary for this route (never includes a credential).
+		// The loopback URL mirrors the upstream path so relative links emitted
+		// by the upstream resolve inside the destination namespace.
 		route := base + "/" + du.Destination + du.BasePath
-		switch du.Tool {
-		case ToolPyPI:
-			// uv and pip both accept an index URL via env. For PyPI-style
-			// registries the route's base path must be the PACKAGE-REPO
-			// ROOT (e.g. /api/pypi/<repo>), NOT the .../simple index: the
-			// PEP 503 simple index lives at <root>/simple, but the file
-			// links it serves resolve to sibling paths OUTSIDE /simple
-			// (JFrog: <root>/packages/...), which must stay inside the
-			// containment subtree. We expose both the uv and pip names so
-			// either tool is covered.
-			index := route + "/simple"
-			env["UV_DEFAULT_INDEX"] = index
-			env["UV_INDEX"] = index
-			env["PIP_INDEX_URL"] = index
-			env["PIP_EXTRA_INDEX_URL"] = index
-		case ToolCargo:
-			// cargo's registry path defaults to rustls+webpki-roots and
-			// ignores env-supplied CAs and (for the registry) HTTP_PROXY
-			// source selection; source replacement must be expressed in
-			// config. Write a config.toml under a per-action CARGO_HOME
-			// that replaces the crates.io source with the loopback route.
-			// CARGO_HOME must be writable: cargo populates
-			// $CARGO_HOME/{registry,git,...} during builds.
-			if err := writeFile("cargo/config.toml", cargoConfigTOML(route)); err != nil {
+		vars := map[string]string{
+			"loopbackRoute":    route,
+			"loopbackBase":     base,
+			"loopbackHostPort": stripURLScheme(route),
+			"host":             du.Host,
+			"destination":      du.Destination,
+			"basePath":         du.BasePath,
+			"actionID":         action.ID,
+			"controlSocket":    cs.cfg.ListenSocket,
+		}
+		if actionDirPath != "" {
+			vars["actionDir"] = actionDirPath
+		}
+
+		// Mint ONLY if a template references a ${credential.*} token (the
+		// gated at-rest exception, already checked against the two-key gate at
+		// config load). Otherwise no broker call happens here: the route is a
+		// pure proxy-redirect (the proxy injects on the upstream leg) or an
+		// at-use credential-helper pointer (the helper fetches at pull time).
+		needsCred := false
+		for _, v := range du.ActionEnv {
+			if referencesCredential(v) {
+				needsCred = true
+			}
+		}
+		for _, f := range du.ActionFiles {
+			if referencesCredential(f.Template, f.Path) {
+				needsCred = true
+			}
+		}
+		if needsCred {
+			tok, err := cs.cache.Get(ctx, action, du.BrokerDestination)
+			if err != nil {
+				return nil, fmt.Errorf("mint credential for destination %q: %w", du.BrokerDestination, err)
+			}
+			vars["credential.token"] = tok.Token
+			vars["credential.username"] = tok.Username
+			vars["credential.scheme"] = tok.Scheme
+			vars["credential.basicAuth"] = basicAuth(tok.Username, tok.Token)
+		}
+
+		for _, f := range du.ActionFiles {
+			relPath, err := renderTemplate(f.Path, vars)
+			if err != nil {
+				return nil, fmt.Errorf("render action_file path %q: %w", f.Path, err)
+			}
+			contents, err := renderTemplate(f.Template, vars)
+			if err != nil {
+				return nil, fmt.Errorf("render action_file %q: %w", f.Path, err)
+			}
+			mode, err := parseFileMode(f.Mode)
+			if err != nil {
 				return nil, err
 			}
-			env["CARGO_HOME"] = filepath.Join(actionDir, "cargo")
-		case ToolDocker:
-			// A docker/OCI client cannot be pointed at a loopback mirror
-			// by env; the registry mirror is daemon/containers
-			// configuration. Write a containers registries.conf mirroring
-			// the upstream host to the loopback route, and point
-			// buildah/podman/skopeo at it via CONTAINERS_REGISTRIES_CONF.
-			if err := writeFile("registries.conf", dockerRegistriesConf(du.Host, route)); err != nil {
+			if err := writeActionFile(relPath, contents, mode); err != nil {
 				return nil, err
 			}
-			env["CONTAINERS_REGISTRIES_CONF"] = filepath.Join(actionDir, "registries.conf")
-		case ToolGit:
-			// git has no index env; an insteadOf rewrite in gitconfig
-			// redirects https://<host>/ to the loopback route. Since git
-			// 2.32, GIT_CONFIG_GLOBAL overrides the search for
-			// $HOME/.gitconfig, so the action's HOME is untouched.
-			if err := writeFile("gitconfig", gitInsteadOf(du.Host, route)); err != nil {
-				return nil, err
+		}
+		for k, v := range du.ActionEnv {
+			rendered, err := renderTemplate(v, vars)
+			if err != nil {
+				return nil, fmt.Errorf("render action_env %q: %w", k, err)
 			}
-			env["GIT_CONFIG_GLOBAL"] = filepath.Join(actionDir, "gitconfig")
+			env[k] = rendered
 		}
 	}
+
 	return env, nil
 }
 
