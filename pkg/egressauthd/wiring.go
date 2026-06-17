@@ -20,6 +20,7 @@ import (
 // gated MODE-C exception). Mirrors the broker's ${secret:NAME}-presence
 // trigger. `grep -r '${credential' <config>` is therefore the complete,
 // statically-auditable list of routes that write a secret into the action.
+// #nosec G101 -- config-token namespace sentinel, not a credential value.
 const credentialTokenPrefix = "${credential."
 
 // validationVars returns every token name the renderer recognises, each

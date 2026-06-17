@@ -394,7 +394,7 @@ func (c *Config) Validate() error {
 		// Two-key gate: a ${credential.*} token writes a secret into the
 		// action's filesystem and is refused unless BOTH allow_credential_at_rest
 		// and the route's at_rest_credential are set.
-		if credInTemplates && !(c.AllowCredentialAtRest && du.AtRestCredential) {
+		if credInTemplates && (!c.AllowCredentialAtRest || !du.AtRestCredential) {
 			return fmt.Errorf("routes[%d] (destination %q): a ${credential.*} token writes a secret into the action; set top-level allow_credential_at_rest=true AND the route at_rest_credential=true to permit it", i, du.Destination)
 		}
 	}

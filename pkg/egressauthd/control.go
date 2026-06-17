@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -348,7 +347,9 @@ func (cs *controlServer) loopbackActionEnv(ctx context.Context, action *Action) 
 		}
 		// O_EXCL: a duplicate target is a config error (Validate dedups; this
 		// is defence-in-depth). O_NOFOLLOW: never write through a symlink.
-		f, err := os.OpenFile(full, os.O_CREATE|os.O_EXCL|os.O_WRONLY|syscall.O_NOFOLLOW, os.FileMode(mode))
+		// #nosec G304 -- full is cleanActionPath-sanitized (above) and opened
+		// O_EXCL|O_NOFOLLOW under a per-action 0700 dir.
+		f, err := os.OpenFile(full, os.O_CREATE|os.O_EXCL|os.O_WRONLY|extraOpenFlags(), os.FileMode(mode))
 		if err != nil {
 			return fmt.Errorf("write %s: %w", relPath, err)
 		}
