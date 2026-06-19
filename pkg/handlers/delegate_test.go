@@ -154,10 +154,76 @@ func TestDelegate_RejectsEmptyRequestedDestinations(t *testing.T) {
 	}
 }
 
-func TestDelegate_RejectsRequestedOutsideAllowed(t *testing.T) {
+// TestDelegate_OverRequestGrantsSubset verifies the grant-subset
+// contract: requesting more destinations than the policy allows
+// narrows the grant to the overlap instead of failing the request.
+func TestDelegate_OverRequestGrantsSubset(t *testing.T) {
 	t.Parallel()
 	h := newDelegateHandler(t, []string{"alpha"})
 	r := httptest.NewRequest(http.MethodPost, "/delegate", strings.NewReader(`{"requested_destinations":["alpha","beta"]}`))
+	r.Header.Set("Authorization", "Bearer good")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want %d (body=%s)", w.Code, http.StatusOK, w.Body.String())
+	}
+	var resp struct {
+		GrantedDestinations []string `json:"granted_destinations"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.GrantedDestinations) != 1 || resp.GrantedDestinations[0] != "alpha" {
+		t.Errorf("granted_destinations: got %v, want [alpha]", resp.GrantedDestinations)
+	}
+}
+
+// TestDelegate_RejectsRequestedDisjointFromAllowed covers the one
+// denial the grant-subset path still emits: an explicit request whose
+// intersection with the allowed set is empty leaves nothing to mint.
+func TestDelegate_RejectsRequestedDisjointFromAllowed(t *testing.T) {
+	t.Parallel()
+	h := newDelegateHandler(t, []string{"alpha"})
+	r := httptest.NewRequest(http.MethodPost, "/delegate", strings.NewReader(`{"requested_destinations":["beta"]}`))
+	r.Header.Set("Authorization", "Bearer good")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusForbidden {
+		t.Errorf("status: got %d, want %d", w.Code, http.StatusForbidden)
+	}
+}
+
+// TestDelegate_WildcardGrantsAllAllowed verifies the "*" sentinel
+// grants the identity's entire policy-allowed set, so a caller can
+// request the maximum it is entitled to without naming destinations.
+func TestDelegate_WildcardGrantsAllAllowed(t *testing.T) {
+	t.Parallel()
+	h := newDelegateHandler(t, []string{"alpha", "beta"})
+	r := httptest.NewRequest(http.MethodPost, "/delegate", strings.NewReader(`{"requested_destinations":["*"]}`))
+	r.Header.Set("Authorization", "Bearer good")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want %d (body=%s)", w.Code, http.StatusOK, w.Body.String())
+	}
+	var resp struct {
+		GrantedDestinations []string `json:"granted_destinations"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.GrantedDestinations) != 2 {
+		t.Errorf("granted_destinations: got %v, want [alpha beta]", resp.GrantedDestinations)
+	}
+}
+
+// TestDelegate_WildcardWithEmptyPolicyDenied confirms the wildcard is
+// not an escalation: an identity that matches no policy entry is still
+// entitled to nothing and gets 403.
+func TestDelegate_WildcardWithEmptyPolicyDenied(t *testing.T) {
+	t.Parallel()
+	h := newDelegateHandler(t, nil)
+	r := httptest.NewRequest(http.MethodPost, "/delegate", strings.NewReader(`{"requested_destinations":["*"]}`))
 	r.Header.Set("Authorization", "Bearer good")
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)

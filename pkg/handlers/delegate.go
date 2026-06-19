@@ -72,13 +72,23 @@ const (
 	denialNonceMintFailed          = "nonce mint failed"
 )
 
+// destinationWildcard is the sentinel a caller places in
+// requested_destinations to ask for the maximum set its identity is
+// entitled to, without having to enumerate destination names. The
+// broker resolves it to the identity's full policy-allowed set, so
+// neither CI workflows nor consuming repos need to know which
+// destinations exist or which their classification grants.
+const destinationWildcard = "*"
+
 // delegateRequest is the JSON body the caller POSTs to /delegate.
 type delegateRequest struct {
 	// RequestedDestinations is the list of destination names the
 	// caller intends to mint tokens for. The handler intersects
-	// this list with the policy-allowed set and rejects the
-	// request if any requested destination is outside the
-	// allowed set.
+	// this list with the policy-allowed set and grants the
+	// overlap, so a caller may safely over-request. The single
+	// element "*" (destinationWildcard) asks for the maximum the
+	// identity is entitled to — the caller never has to know the
+	// destination names.
 	RequestedDestinations []string `json:"requested_destinations"`
 }
 
@@ -155,13 +165,31 @@ func (h *DelegateHandler) serve(w http.ResponseWriter, r *http.Request) (int, st
 	}
 	if len(allowed) == 0 {
 		h.recordDenial(r, identity, denialNoPolicyEntryMatched)
-		http.Error(w, "requested destination is not allowed for this identity", http.StatusForbidden)
+		http.Error(w, "identity is not entitled to any destinations", http.StatusForbidden)
 		return http.StatusForbidden, identityType
 	}
-	for _, d := range req.RequestedDestinations {
-		if !slices.Contains(allowed, d) {
-			h.recordDenial(r, identity, denialDestinationNotInGrantSet+": "+d)
-			http.Error(w, "requested destination is not allowed for this identity", http.StatusForbidden)
+
+	// Resolve the granted set. A wildcard request asks for the maximum
+	// the identity's claims permit, so the grant is the entire
+	// policy-allowed set — the caller never enumerates destination
+	// names. An explicit list is intersected with the allowed set
+	// (grant-subset): over-requesting narrows the grant rather than
+	// failing it. The grant — not the raw request — is what the nonce
+	// records, the response advertises, and the audit log names, so
+	// /token only ever redeems destinations the policy actually permits.
+	var granted []string
+	if slices.Contains(req.RequestedDestinations, destinationWildcard) {
+		granted = allowed
+	} else {
+		granted = make([]string, 0, len(req.RequestedDestinations))
+		for _, d := range req.RequestedDestinations {
+			if slices.Contains(allowed, d) {
+				granted = append(granted, d)
+			}
+		}
+		if len(granted) == 0 {
+			h.recordDenial(r, identity, denialDestinationNotInGrantSet)
+			http.Error(w, "none of the requested destinations are allowed for this identity", http.StatusForbidden)
 			return http.StatusForbidden, identityType
 		}
 	}
@@ -174,7 +202,7 @@ func (h *DelegateHandler) serve(w http.ResponseWriter, r *http.Request) (int, st
 	// names the issued token by.
 	rec := &store.Record{
 		Identity:            identity,
-		AllowedDestinations: req.RequestedDestinations,
+		AllowedDestinations: granted,
 	}
 	nonce, err := h.nonces.Mint(rec)
 	if err != nil {
@@ -183,11 +211,11 @@ func (h *DelegateHandler) serve(w http.ResponseWriter, r *http.Request) (int, st
 		return http.StatusInternalServerError, identityType
 	}
 
-	h.recordGrant(r, identity, req.RequestedDestinations, rec)
+	h.recordGrant(r, identity, granted, rec)
 	writeJSON(w, http.StatusOK, delegateResponse{
 		Nonce:               nonce,
 		ExpiresAt:           rec.ExpiresAt,
-		GrantedDestinations: req.RequestedDestinations,
+		GrantedDestinations: granted,
 	})
 	return http.StatusOK, identityType
 }
