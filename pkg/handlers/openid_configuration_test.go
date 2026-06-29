@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/handlers"
+	"github.com/Muon-Space/bb-credential-broker/pkg/handlers"
 )
 
 func TestOpenIDConfiguration_GET(t *testing.T) {

@@ -1,4 +1,4 @@
-module muonspace.ghe.com/Muon-Space/bb-credential-broker
+module github.com/Muon-Space/bb-credential-broker
 
 go 1.25.0
 

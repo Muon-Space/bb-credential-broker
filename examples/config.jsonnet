@@ -228,6 +228,48 @@
       },
     },
 
+    // A token-exchange destination whose downstream performs a
+    // Basic-auth handshake with the username derived from a claim
+    // of the minted token. The mint flow is identical to
+    // 'artifactory-prod' above; the only addition is
+    // response.usernameClaim, which JMESPath-evaluates against
+    // the decoded JWT payload of the minted access token and
+    // surfaces the resolved string on the /token response's
+    // username field. The effective scheme defaults to 'basic'
+    // because that is the only reason to derive a username at
+    // all; an explicit response.scheme overrides.
+    //
+    // Used by services whose Basic-auth handshake validates the
+    // supplied username against a claim of the bearer token —
+    // typically identity-bound (group-scoped or mapping-scoped)
+    // tokens where the upstream rejects placeholder usernames.
+    'identity-bound-registry': {
+      oidcTokenExchange: {
+        url:          'https://destination.example.com/access/api/v1/oidc/token',
+        providerName: 'bb-credential-broker',
+        bodyFormat:   'json',
+        subjectToken: {
+          signedJWT: {
+            signingKey: 'broker-signing-key',
+            issuer:     'https://bb-credential-broker.example.com',
+            subject:    '${identity.principal}',
+            audience:   'destination-token-exchange',
+            ttl:        '5m',
+          },
+        },
+        response: {
+          tokenJsonPath:     'access_token',
+          expiresInJsonPath: 'expires_in',
+          // Lift the Basic-auth username out of the minted JWT.
+          // Parameterising the claim path lets the same destination
+          // shape support upstreams whose identity-bearing claim
+          // is named differently (azp, preferred_username, a
+          // custom claim, ...).
+          usernameClaim: 'sub',
+        },
+      },
+    },
+
     // staticSecret dispenses a credential read verbatim from a file
     // on disk. The intended source is a Kubernetes Secret mounted
     // into the broker's pod; operators are free to populate the

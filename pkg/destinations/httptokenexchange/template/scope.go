@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"time"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/auth"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/secrets"
+	"github.com/Muon-Space/bb-credential-broker/pkg/auth"
+	"github.com/Muon-Space/bb-credential-broker/pkg/secrets"
 )
 
 // Scope is the per-evaluation context passed to every chunk during

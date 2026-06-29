@@ -20,7 +20,7 @@ import (
 	"os"
 	"time"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/auth"
+	"github.com/Muon-Space/bb-credential-broker/pkg/auth"
 )
 
 // DefaultCacheTTL is the value advertised in the response's

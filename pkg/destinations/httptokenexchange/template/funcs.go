@@ -12,7 +12,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/signer"
+	"github.com/Muon-Space/bb-credential-broker/pkg/signer"
 )
 
 // DefaultFuncs returns a fresh registry containing the built-in

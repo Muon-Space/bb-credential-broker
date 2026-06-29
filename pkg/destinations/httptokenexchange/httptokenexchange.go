@@ -24,8 +24,8 @@ import (
 
 	"github.com/jmespath/go-jmespath"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/destinations/httptokenexchange/template"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/secrets"
+	"github.com/Muon-Space/bb-credential-broker/pkg/destinations/httptokenexchange/template"
+	"github.com/Muon-Space/bb-credential-broker/pkg/secrets"
 )
 
 // requestTimeout is the upper bound on a single outbound mint
@@ -131,8 +131,29 @@ type ResponseConfig struct {
 	ExpiresAtJSONPath string `json:"expiresAtJsonPath,omitempty"`
 
 	// Scheme is propagated verbatim to the worker as the
-	// Token's Scheme. Empty defaults to "bearer".
+	// Token's Scheme. Empty defaults to "bearer". When
+	// UsernameClaim is set and Scheme is empty, the effective
+	// scheme defaults to "basic" instead.
 	Scheme string `json:"scheme,omitempty"`
+
+	// UsernameClaim, when non-empty, is the JMESPath expression
+	// evaluated against the decoded JWT payload of the minted
+	// access token to obtain the Basic-auth username. Setting
+	// this defaults Scheme to "basic" (operators may still set
+	// Scheme explicitly to override). Used by services whose
+	// Basic-auth handshake validates the supplied username
+	// against a claim of the bearer token, where the token is
+	// identity-bound and the upstream rejects placeholder
+	// usernames.
+	//
+	// Mint fails closed if the minted token is not a parseable
+	// JWT, the claim is not present, or the resolved value is
+	// not a string. The token's signature is not verified: the
+	// broker just received it from a TLS-authenticated upstream
+	// exchange it itself initiated, so the claim read is a
+	// reformatting of the broker's own output, not a trust
+	// decision.
+	UsernameClaim string `json:"usernameClaim,omitempty"`
 }
 
 // Dependencies bundles the shared services that the destination
@@ -169,9 +190,10 @@ type Impl struct {
 	parsedJSON    *template.Template
 	parsedRaw     *template.Template
 
-	tokenPath     *jmespath.JMESPath
-	expiresInPath *jmespath.JMESPath
-	expiresAtPath *jmespath.JMESPath
+	tokenPath         *jmespath.JMESPath
+	expiresInPath     *jmespath.JMESPath
+	expiresAtPath     *jmespath.JMESPath
+	usernameClaimPath *jmespath.JMESPath
 
 	client *http.Client
 }
@@ -245,6 +267,11 @@ func New(name string, cfg *Config, deps Dependencies) (*Impl, error) {
 	if cfg.Response.ExpiresAtJSONPath != "" {
 		if out.expiresAtPath, err = jmespath.Compile(cfg.Response.ExpiresAtJSONPath); err != nil {
 			return nil, fmt.Errorf("response.expiresAtJsonPath: %w", err)
+		}
+	}
+	if cfg.Response.UsernameClaim != "" {
+		if out.usernameClaimPath, err = jmespath.Compile(cfg.Response.UsernameClaim); err != nil {
+			return nil, fmt.Errorf("response.usernameClaim: %w", err)
 		}
 	}
 
@@ -495,6 +522,7 @@ func validateConfig(cfg *Config) error {
 type Token struct {
 	Value     string
 	Scheme    string
+	Username  string
 	ExpiresAt time.Time
 }
 

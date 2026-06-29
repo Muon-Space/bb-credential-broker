@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/secrets"
+	"github.com/Muon-Space/bb-credential-broker/pkg/secrets"
 )
 
 // algRS256 is the JWA algorithm identifier the broker advertises

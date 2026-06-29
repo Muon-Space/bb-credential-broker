@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/config"
+	"github.com/Muon-Space/bb-credential-broker/pkg/config"
 )
 
 const validJsonnet = `
@@ -257,8 +257,8 @@ func TestLoad_ExampleConfigParses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if len(cfg.Destinations) != 4 {
-		t.Errorf("Destinations: got %d, want 4", len(cfg.Destinations))
+	if len(cfg.Destinations) != 5 {
+		t.Errorf("Destinations: got %d, want 5", len(cfg.Destinations))
 	}
 	if len(cfg.Secrets) != 2 {
 		t.Errorf("Secrets: got %d, want 2", len(cfg.Secrets))

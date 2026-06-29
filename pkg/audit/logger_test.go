@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/audit"
+	"github.com/Muon-Space/bb-credential-broker/pkg/audit"
 )
 
 func TestLogger_DelegateGranted(t *testing.T) {

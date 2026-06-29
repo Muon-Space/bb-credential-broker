@@ -16,8 +16,8 @@ import (
 	"strings"
 	"testing"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/secrets"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/signer"
+	"github.com/Muon-Space/bb-credential-broker/pkg/secrets"
+	"github.com/Muon-Space/bb-credential-broker/pkg/signer"
 )
 
 // generateRSAPEM returns a PEM-encoded PKCS#1 RSA private key for

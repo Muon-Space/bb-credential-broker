@@ -13,10 +13,10 @@ import (
 	"sort"
 	"strings"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/auth"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/config"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/destinations"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/secrets"
+	"github.com/Muon-Space/bb-credential-broker/pkg/auth"
+	"github.com/Muon-Space/bb-credential-broker/pkg/config"
+	"github.com/Muon-Space/bb-credential-broker/pkg/destinations"
+	"github.com/Muon-Space/bb-credential-broker/pkg/secrets"
 )
 
 // renderUsage is the operator-facing usage string for the render

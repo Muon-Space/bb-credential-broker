@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/secrets"
+	"github.com/Muon-Space/bb-credential-broker/pkg/secrets"
 )
 
 // retryLoader is a secrets.Loader that fails the first failUntil

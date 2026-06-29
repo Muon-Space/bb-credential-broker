@@ -9,7 +9,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/auth"
+	"github.com/Muon-Space/bb-credential-broker/pkg/auth"
 )
 
 // MinSignedKeyBytes is the minimum length of the HMAC signing key.

@@ -20,12 +20,12 @@ import (
 	"net/http"
 	"time"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/auth"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/destinations/httptokenexchange"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/destinations/oidctokenexchange"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/destinations/staticsecret"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/metrics"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/secrets"
+	"github.com/Muon-Space/bb-credential-broker/pkg/auth"
+	"github.com/Muon-Space/bb-credential-broker/pkg/destinations/httptokenexchange"
+	"github.com/Muon-Space/bb-credential-broker/pkg/destinations/oidctokenexchange"
+	"github.com/Muon-Space/bb-credential-broker/pkg/destinations/staticsecret"
+	"github.com/Muon-Space/bb-credential-broker/pkg/metrics"
+	"github.com/Muon-Space/bb-credential-broker/pkg/secrets"
 )
 
 // Destination is the interface implemented by every concrete
@@ -237,6 +237,7 @@ func (a *httpTokenExchangeAdapter) Mint(ctx context.Context, identity *auth.Iden
 		Value:     t.Value,
 		ExpiresAt: t.ExpiresAt,
 		Scheme:    scheme,
+		Username:  t.Username,
 	}, nil
 }
 

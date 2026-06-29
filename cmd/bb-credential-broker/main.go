@@ -28,8 +28,8 @@ import (
 	"log/slog"
 	"os"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/app"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/config"
+	"github.com/Muon-Space/bb-credential-broker/pkg/app"
+	"github.com/Muon-Space/bb-credential-broker/pkg/config"
 )
 
 func main() {

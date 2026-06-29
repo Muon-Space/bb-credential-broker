@@ -16,10 +16,10 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/auth"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/destinations/httptokenexchange"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/destinations/oidctokenexchange"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/secrets"
+	"github.com/Muon-Space/bb-credential-broker/pkg/auth"
+	"github.com/Muon-Space/bb-credential-broker/pkg/destinations/httptokenexchange"
+	"github.com/Muon-Space/bb-credential-broker/pkg/destinations/oidctokenexchange"
+	"github.com/Muon-Space/bb-credential-broker/pkg/secrets"
 )
 
 // loaderWithKey returns a secrets.Loader seeded with a freshly-

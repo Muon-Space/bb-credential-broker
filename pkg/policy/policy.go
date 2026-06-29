@@ -23,7 +23,7 @@ import (
 	"slices"
 	"strings"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/auth"
+	"github.com/Muon-Space/bb-credential-broker/pkg/auth"
 )
 
 // Config is the policy section of the broker's top-level

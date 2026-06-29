@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/destinations/httptokenexchange"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/secrets"
+	"github.com/Muon-Space/bb-credential-broker/pkg/destinations/httptokenexchange"
+	"github.com/Muon-Space/bb-credential-broker/pkg/secrets"
 )
 
 func newDeps() httptokenexchange.Dependencies {

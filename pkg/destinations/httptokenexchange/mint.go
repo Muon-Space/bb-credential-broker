@@ -10,9 +10,11 @@ import (
 	"strings"
 	"time"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/audit"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/auth"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/destinations/httptokenexchange/template"
+	"github.com/golang-jwt/jwt/v5"
+
+	"github.com/Muon-Space/bb-credential-broker/pkg/audit"
+	"github.com/Muon-Space/bb-credential-broker/pkg/auth"
+	"github.com/Muon-Space/bb-credential-broker/pkg/destinations/httptokenexchange/template"
 )
 
 // upstreamExcerptBytes bounds the response-body prefix the audit
@@ -261,11 +263,63 @@ func (i *Impl) extractToken(decoded any) (*Token, error) {
 		return nil, err
 	}
 
+	scheme := i.cfg.Response.Scheme
+	var username string
+	if i.usernameClaimPath != nil {
+		u, err := i.extractUsernameClaim(tokenStr)
+		if err != nil {
+			return nil, err
+		}
+		username = u
+		// Default Scheme to "basic" only when the operator did
+		// not set one explicitly: a Basic-auth handshake is the
+		// reason to derive a username at all, but an operator
+		// pairing usernameClaim with an unusual scheme (e.g. a
+		// proprietary "negotiate"-style header that carries
+		// user:secret) retains control.
+		if scheme == "" {
+			scheme = "basic"
+		}
+	}
+
 	return &Token{
 		Value:     tokenStr,
-		Scheme:    i.cfg.Response.Scheme,
+		Scheme:    scheme,
+		Username:  username,
 		ExpiresAt: expiresAt,
 	}, nil
+}
+
+// extractUsernameClaim parses tokenStr as a JWT and applies the
+// configured JMESPath to its decoded payload. The token's signature
+// is intentionally not verified: the broker just received tokenStr
+// from a TLS-authenticated upstream exchange it itself initiated, so
+// reading a claim out of it is a reformatting of the broker's own
+// output, not a trust decision.
+//
+// All three failure paths are fail-closed and name the offending
+// field so audit-log readers can pinpoint the misconfiguration: a
+// non-JWT minted token (the upstream's access token format does not
+// carry inspectable claims), a claim that is absent from the
+// payload, or a claim whose value is not a string.
+func (i *Impl) extractUsernameClaim(tokenStr string) (string, error) {
+	claims := jwt.MapClaims{}
+	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
+	if _, _, err := parser.ParseUnverified(tokenStr, claims); err != nil {
+		return "", fmt.Errorf("usernameClaim: minted token is not a parseable JWT: %w", err)
+	}
+	v, err := i.usernameClaimPath.Search(map[string]any(claims))
+	if err != nil {
+		return "", fmt.Errorf("apply usernameClaim: %w", err)
+	}
+	if v == nil {
+		return "", fmt.Errorf("usernameClaim %q yielded no value", i.cfg.Response.UsernameClaim)
+	}
+	s, ok := v.(string)
+	if !ok {
+		return "", fmt.Errorf("usernameClaim %q resolved to non-string %T", i.cfg.Response.UsernameClaim, v)
+	}
+	return s, nil
 }
 
 // extractExpiry applies whichever expiry JMESPath is configured and

@@ -10,13 +10,14 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/auth"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/destinations"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/metrics"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/secrets"
+	"github.com/Muon-Space/bb-credential-broker/pkg/auth"
+	"github.com/Muon-Space/bb-credential-broker/pkg/destinations"
+	"github.com/Muon-Space/bb-credential-broker/pkg/metrics"
+	"github.com/Muon-Space/bb-credential-broker/pkg/secrets"
 )
 
 func TestBuildRegistry_HappyPath(t *testing.T) {
@@ -291,6 +292,55 @@ func TestBuildRegistry_RejectsMultipleDiscriminators(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error for multiple discriminators, got nil")
+	}
+}
+
+// TestBuildRegistry_HTTPTokenExchangeUsernameClaim_PropagatesEndToEnd
+// pins the httpTokenExchangeAdapter's Username propagation alongside
+// the underlying usernameClaim extraction. The Impl reads sub out of
+// the upstream's JWT-shaped access_token, defaults the Scheme to
+// "basic", and the adapter must forward both fields onto the public
+// Token returned through Registry.Lookup. A regression in either
+// half (the adapter dropping Username, or the Impl failing to set it)
+// trips this test.
+func TestBuildRegistry_HTTPTokenExchangeUsernameClaim_PropagatesEndToEnd(t *testing.T) {
+	t.Parallel()
+	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{"sub": "alice"})
+	signed, err := tok.SignedString([]byte("test-secret"))
+	if err != nil {
+		t.Fatalf("sign test JWT: %v", err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"access_token":"` + signed + `"}`))
+	}))
+	defer srv.Close()
+
+	raw := map[string]json.RawMessage{
+		"with-username-claim": json.RawMessage(`{
+			"httpTokenExchange": {
+				"request": {"method": "POST", "url": "` + srv.URL + `/"},
+				"response": {"tokenJsonPath": "access_token", "usernameClaim": "sub"}
+			}
+		}`),
+	}
+	reg, err := destinations.BuildRegistry(raw, destinations.Dependencies{
+		Secrets:      secrets.NewMapLoader(),
+		NamedSecrets: map[string]secrets.SecretRef{},
+	})
+	if err != nil {
+		t.Fatalf("BuildRegistry: %v", err)
+	}
+	out, err := reg.Lookup("with-username-claim").Mint(context.Background(),
+		&auth.Identity{Type: auth.IdentityTypeCI, Principal: "p"})
+	if err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+	if out.Username != "alice" {
+		t.Errorf("Token.Username: got %q, want %q (adapter must propagate the inner Username)", out.Username, "alice")
+	}
+	if out.Scheme != "basic" {
+		t.Errorf("Token.Scheme: got %q, want %q", out.Scheme, "basic")
 	}
 }
 
