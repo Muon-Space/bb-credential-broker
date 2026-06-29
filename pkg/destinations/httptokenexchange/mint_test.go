@@ -11,11 +11,29 @@ import (
 	"testing"
 	"time"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/audit"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/auth"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/destinations/httptokenexchange"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/secrets"
+	"github.com/golang-jwt/jwt/v5"
+
+	"github.com/Muon-Space/bb-credential-broker/pkg/audit"
+	"github.com/Muon-Space/bb-credential-broker/pkg/auth"
+	"github.com/Muon-Space/bb-credential-broker/pkg/destinations/httptokenexchange"
+	"github.com/Muon-Space/bb-credential-broker/pkg/secrets"
 )
+
+// signTestJWT returns a JWT signed with HS256 over the supplied
+// claims. The signature is never verified by the code under test
+// (the broker reads usernameClaim out of the token via
+// ParseUnverified because it just received the token from the
+// authenticated upstream and is only reformatting it), so the
+// signing key is an arbitrary per-test secret.
+func signTestJWT(t *testing.T, claims jwt.MapClaims) string {
+	t.Helper()
+	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := tok.SignedString([]byte("test-secret"))
+	if err != nil {
+		t.Fatalf("sign test JWT: %v", err)
+	}
+	return signed
+}
 
 // fakeDestination wraps an httptest.Server with a recording handler
 // so that tests can both stand up a fake upstream and inspect the
@@ -752,5 +770,213 @@ func TestMint_NoMintAuditInContextIsHarmless(t *testing.T) {
 	// No ContextWithMintAudit wrapper here.
 	if _, err := impl.Mint(context.Background(), newTestIdentity()); err != nil {
 		t.Fatalf("Mint without MintAudit context: %v", err)
+	}
+}
+
+// TestMint_UsernameClaim_HappyPath covers the standard usage: an
+// access token shaped as a JWT is returned by the upstream, and a
+// usernameClaim JMESPath lifts a string claim out of its decoded
+// payload to populate Token.Username. The Scheme defaults to "basic"
+// because that is the reason to derive a username at all.
+func TestMint_UsernameClaim_HappyPath(t *testing.T) {
+	t.Parallel()
+	accessToken := signTestJWT(t, jwt.MapClaims{"sub": "alice"})
+	body, _ := json.Marshal(map[string]any{"access_token": accessToken})
+	fake := newFakeDestination(http.StatusOK, string(body))
+	defer fake.Close()
+
+	cfg := &httptokenexchange.Config{
+		Request: httptokenexchange.RequestConfig{Method: "POST", URL: fake.URL() + "/"},
+		Response: httptokenexchange.ResponseConfig{
+			TokenJSONPath: "access_token",
+			UsernameClaim: "sub",
+		},
+	}
+	impl, err := httptokenexchange.New("test", cfg, newTestDeps())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	tok, err := impl.Mint(context.Background(), newTestIdentity())
+	if err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+	if tok.Value != accessToken {
+		t.Errorf("Token.Value: got %q, want the minted access token", tok.Value)
+	}
+	if tok.Username != "alice" {
+		t.Errorf("Token.Username: got %q, want %q", tok.Username, "alice")
+	}
+	if tok.Scheme != "basic" {
+		t.Errorf("Token.Scheme: got %q, want %q (default when usernameClaim is set)", tok.Scheme, "basic")
+	}
+}
+
+// TestMint_UsernameClaim_ExplicitSchemeWins confirms that an
+// operator who pairs usernameClaim with an explicit Scheme keeps
+// their override; the basic default applies only when Scheme is
+// empty.
+func TestMint_UsernameClaim_ExplicitSchemeWins(t *testing.T) {
+	t.Parallel()
+	accessToken := signTestJWT(t, jwt.MapClaims{"sub": "alice"})
+	body, _ := json.Marshal(map[string]any{"access_token": accessToken})
+	fake := newFakeDestination(http.StatusOK, string(body))
+	defer fake.Close()
+
+	cfg := &httptokenexchange.Config{
+		Request: httptokenexchange.RequestConfig{Method: "POST", URL: fake.URL() + "/"},
+		Response: httptokenexchange.ResponseConfig{
+			TokenJSONPath: "access_token",
+			UsernameClaim: "sub",
+			Scheme:        "bearer",
+		},
+	}
+	impl, err := httptokenexchange.New("test", cfg, newTestDeps())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	tok, err := impl.Mint(context.Background(), newTestIdentity())
+	if err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+	if tok.Username != "alice" {
+		t.Errorf("Token.Username: got %q, want %q", tok.Username, "alice")
+	}
+	if tok.Scheme != "bearer" {
+		t.Errorf("Token.Scheme: got %q, want %q (explicit operator override)", tok.Scheme, "bearer")
+	}
+}
+
+// TestMint_UsernameClaim_NotAJWT covers the fail-closed path when
+// the upstream returns an opaque access token (no inspectable
+// claims). The mint fails and the error names the offending field
+// so operators can locate the misconfigured destination.
+func TestMint_UsernameClaim_NotAJWT(t *testing.T) {
+	t.Parallel()
+	fake := newFakeDestination(http.StatusOK, `{"access_token":"opaque-not-a-jwt"}`)
+	defer fake.Close()
+
+	cfg := &httptokenexchange.Config{
+		Request: httptokenexchange.RequestConfig{Method: "POST", URL: fake.URL() + "/"},
+		Response: httptokenexchange.ResponseConfig{
+			TokenJSONPath: "access_token",
+			UsernameClaim: "sub",
+		},
+	}
+	impl, err := httptokenexchange.New("test", cfg, newTestDeps())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = impl.Mint(context.Background(), newTestIdentity())
+	if err == nil {
+		t.Fatal("expected mint error for non-JWT access token, got nil")
+	}
+	if !strings.Contains(err.Error(), "usernameClaim") {
+		t.Errorf("error %q should name usernameClaim", err.Error())
+	}
+}
+
+// TestMint_UsernameClaim_Missing covers the fail-closed path when
+// the JWT payload does not contain the named claim.
+func TestMint_UsernameClaim_Missing(t *testing.T) {
+	t.Parallel()
+	accessToken := signTestJWT(t, jwt.MapClaims{"aud": "downstream"})
+	body, _ := json.Marshal(map[string]any{"access_token": accessToken})
+	fake := newFakeDestination(http.StatusOK, string(body))
+	defer fake.Close()
+
+	cfg := &httptokenexchange.Config{
+		Request: httptokenexchange.RequestConfig{Method: "POST", URL: fake.URL() + "/"},
+		Response: httptokenexchange.ResponseConfig{
+			TokenJSONPath: "access_token",
+			UsernameClaim: "sub",
+		},
+	}
+	impl, err := httptokenexchange.New("test", cfg, newTestDeps())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = impl.Mint(context.Background(), newTestIdentity())
+	if err == nil {
+		t.Fatal("expected mint error for missing claim, got nil")
+	}
+	if !strings.Contains(err.Error(), "usernameClaim") {
+		t.Errorf("error %q should name usernameClaim", err.Error())
+	}
+}
+
+// TestMint_UsernameClaim_NonString covers the fail-closed path when
+// the claim resolves to a non-string value (e.g. a number or array).
+func TestMint_UsernameClaim_NonString(t *testing.T) {
+	t.Parallel()
+	accessToken := signTestJWT(t, jwt.MapClaims{"sub": 42})
+	body, _ := json.Marshal(map[string]any{"access_token": accessToken})
+	fake := newFakeDestination(http.StatusOK, string(body))
+	defer fake.Close()
+
+	cfg := &httptokenexchange.Config{
+		Request: httptokenexchange.RequestConfig{Method: "POST", URL: fake.URL() + "/"},
+		Response: httptokenexchange.ResponseConfig{
+			TokenJSONPath: "access_token",
+			UsernameClaim: "sub",
+		},
+	}
+	impl, err := httptokenexchange.New("test", cfg, newTestDeps())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = impl.Mint(context.Background(), newTestIdentity())
+	if err == nil {
+		t.Fatal("expected mint error for non-string claim, got nil")
+	}
+	if !strings.Contains(err.Error(), "non-string") {
+		t.Errorf("error %q should mention non-string", err.Error())
+	}
+}
+
+// TestNew_RejectsMalformedUsernameClaim pins the configuration-time
+// JMESPath compile check so a typo'd expression surfaces at broker
+// start-up rather than at the first /token request.
+func TestNew_RejectsMalformedUsernameClaim(t *testing.T) {
+	t.Parallel()
+	cfg := &httptokenexchange.Config{
+		Request: httptokenexchange.RequestConfig{Method: "POST", URL: "https://example.com/"},
+		Response: httptokenexchange.ResponseConfig{
+			TokenJSONPath: "access_token",
+			UsernameClaim: "[invalid",
+		},
+	}
+	if _, err := httptokenexchange.New("x", cfg, newTestDeps()); err == nil {
+		t.Fatal("expected JMESPath compile error, got nil")
+	}
+}
+
+// TestMint_UsernameClaim_Unset pins the no-op default: an
+// httpTokenExchange without UsernameClaim leaves Username empty
+// and Scheme empty on the Impl's Token. The bearer default is
+// applied by the parent destinations package's adapter.
+func TestMint_UsernameClaim_Unset(t *testing.T) {
+	t.Parallel()
+	accessToken := signTestJWT(t, jwt.MapClaims{"sub": "alice"})
+	body, _ := json.Marshal(map[string]any{"access_token": accessToken})
+	fake := newFakeDestination(http.StatusOK, string(body))
+	defer fake.Close()
+
+	cfg := &httptokenexchange.Config{
+		Request:  httptokenexchange.RequestConfig{Method: "POST", URL: fake.URL() + "/"},
+		Response: httptokenexchange.ResponseConfig{TokenJSONPath: "access_token"},
+	}
+	impl, err := httptokenexchange.New("test", cfg, newTestDeps())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	tok, err := impl.Mint(context.Background(), newTestIdentity())
+	if err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+	if tok.Username != "" {
+		t.Errorf("Token.Username: got %q, want empty when UsernameClaim is unset", tok.Username)
+	}
+	if tok.Scheme != "" {
+		t.Errorf("Token.Scheme: got %q, want empty (adapter applies bearer default)", tok.Scheme)
 	}
 }

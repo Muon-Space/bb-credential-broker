@@ -59,7 +59,15 @@ The top-level structure is:
     'token-exchange-destination': {
       httpTokenExchange: {
         request:  { method, url, headers, body },
-        response: { tokenJsonPath, expiresInJsonPath OR expiresAtJsonPath },
+        response: {
+          tokenJsonPath,
+          expiresInJsonPath OR expiresAtJsonPath,
+          scheme:        'bearer' | 'basic',  // optional, default 'bearer'
+          usernameClaim: '<JMESPath>',        // optional; when set, lifts the
+                                              // Basic-auth username out of the
+                                              // minted JWT's payload and
+                                              // defaults scheme to 'basic'.
+        },
       },
     },
     'static-secret-destination': {
@@ -295,6 +303,64 @@ for each depends on what the downstream OIDC provider validates:
 
 `examples/config.jsonnet` carries a worked end-to-end example
 under the `artifactory-prod` destination.
+
+#### Basic-auth username derived from a token claim
+
+A few downstreams perform a Basic-auth handshake whose username
+must match a claim of the bearer token they just issued —
+typically because the token is identity-bound (a group-scoped or
+mapping-scoped access token) and the upstream rejects placeholder
+usernames. The OCI Distribution Spec's `/v2/token` endpoint behind
+some artifact registries is the most common shape.
+
+Set `response.usernameClaim` to the JMESPath of the claim that
+carries the username inside the minted token. The broker
+JSON-decodes the token's JWT payload (signature is not verified —
+the broker just received it from the authenticated upstream
+exchange and is reformatting its own output, not making a trust
+decision), evaluates the path against the claims, and surfaces the
+resolved string on the `/token` response's `username` field. The
+effective `scheme` defaults to `basic` when `usernameClaim` is
+set; operators may still set `response.scheme` explicitly to
+override.
+
+```jsonnet
+'token-exchange-with-basic-auth': {
+  oidcTokenExchange: {
+    url:          'https://destination.example.com/access/api/v1/oidc/token',
+    providerName: 'bb-credential-broker',
+    subjectToken: { signedJWT: {
+      signingKey: 'broker-signing-key',
+      issuer:     'https://broker.example.com',
+      subject:    '${identity.principal}',
+      audience:   'destination-token-exchange',
+      ttl:        '5m',
+    } },
+    response: {
+      tokenJsonPath: 'access_token',
+      // The minted access token is a JWT whose 'sub' claim is the
+      // username the downstream Basic-auth handshake will validate
+      // against. Parameterising the claim path lets the same
+      // destination shape support downstreams whose identity-
+      // bearing claim is named differently (azp, preferred_username,
+      // a custom claim, ...).
+      usernameClaim: 'sub',
+    },
+  },
+}
+```
+
+Mint fails closed and the error names `usernameClaim` if any of
+three things go wrong: the minted access token is not a parseable
+JWT (the upstream returned an opaque token), the claim is absent
+from the payload, or the resolved value is not a string. The
+JMESPath is compiled at broker start-up, so an invalid expression
+fails the `bb-credential-broker validate` subcommand rather than
+the first `/token` request.
+
+The field is available on every destination that compiles to
+`httpTokenExchange`, including the `oidcTokenExchange` sugar. The
+field is unset by default; existing destinations are unaffected.
 
 #### Higher-level destination type for the common case
 

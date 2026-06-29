@@ -237,6 +237,7 @@ func (a *httpTokenExchangeAdapter) Mint(ctx context.Context, identity *auth.Iden
 		Value:     t.Value,
 		ExpiresAt: t.ExpiresAt,
 		Scheme:    scheme,
+		Username:  t.Username,
 	}, nil
 }
 
