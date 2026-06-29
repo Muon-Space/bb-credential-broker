@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/secrets"
+	"github.com/Muon-Space/bb-credential-broker/pkg/secrets"
 )
 
 // TestSecretRef_UnmarshalIsStrict pins the invariant that a typo

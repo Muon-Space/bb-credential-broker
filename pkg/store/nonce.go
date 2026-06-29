@@ -11,7 +11,7 @@ import (
 	"slices"
 	"time"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/auth"
+	"github.com/Muon-Space/bb-credential-broker/pkg/auth"
 )
 
 // ErrNotFound is returned when the supplied token is not recognised

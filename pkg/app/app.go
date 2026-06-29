@@ -23,16 +23,16 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/errgroup"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/audit"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/auth"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/config"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/destinations"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/handlers"
-	brokermetrics "muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/metrics"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/policy"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/secrets"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/signer"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/store"
+	"github.com/Muon-Space/bb-credential-broker/pkg/audit"
+	"github.com/Muon-Space/bb-credential-broker/pkg/auth"
+	"github.com/Muon-Space/bb-credential-broker/pkg/config"
+	"github.com/Muon-Space/bb-credential-broker/pkg/destinations"
+	"github.com/Muon-Space/bb-credential-broker/pkg/handlers"
+	brokermetrics "github.com/Muon-Space/bb-credential-broker/pkg/metrics"
+	"github.com/Muon-Space/bb-credential-broker/pkg/policy"
+	"github.com/Muon-Space/bb-credential-broker/pkg/secrets"
+	"github.com/Muon-Space/bb-credential-broker/pkg/signer"
+	"github.com/Muon-Space/bb-credential-broker/pkg/store"
 )
 
 // App is the running broker. Construction is split from Run so that

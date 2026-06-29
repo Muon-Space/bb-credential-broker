@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/auth"
+	"github.com/Muon-Space/bb-credential-broker/pkg/auth"
 )
 
 func TestResolveIdentity_CI(t *testing.T) {

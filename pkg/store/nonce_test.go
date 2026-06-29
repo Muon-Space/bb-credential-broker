@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/auth"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/store"
+	"github.com/Muon-Space/bb-credential-broker/pkg/auth"
+	"github.com/Muon-Space/bb-credential-broker/pkg/store"
 )
 
 // newRecord returns a Record populated with values typical of a

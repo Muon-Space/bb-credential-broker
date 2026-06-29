@@ -8,7 +8,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/metrics"
+	"github.com/Muon-Space/bb-credential-broker/pkg/metrics"
 )
 
 func TestNew_RegistersAllCollectors(t *testing.T) {

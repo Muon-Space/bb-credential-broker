@@ -28,7 +28,7 @@ import (
 	"log/slog"
 	"os"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/egressauthd"
+	"github.com/Muon-Space/bb-credential-broker/pkg/egressauthd"
 )
 
 func main() {

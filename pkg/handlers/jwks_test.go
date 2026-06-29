@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/handlers"
+	"github.com/Muon-Space/bb-credential-broker/pkg/handlers"
 )
 
 const fixtureJWKS = `{"keys":[{"alg":"RS256","e":"AQAB","kid":"fixture-kid","kty":"RSA","n":"AQAB","use":"sig"}]}`

@@ -8,11 +8,11 @@ import (
 	"strings"
 	"time"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/audit"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/auth"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/destinations"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/metrics"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/store"
+	"github.com/Muon-Space/bb-credential-broker/pkg/audit"
+	"github.com/Muon-Space/bb-credential-broker/pkg/auth"
+	"github.com/Muon-Space/bb-credential-broker/pkg/destinations"
+	"github.com/Muon-Space/bb-credential-broker/pkg/metrics"
+	"github.com/Muon-Space/bb-credential-broker/pkg/store"
 )
 
 // TokenHandler implements POST /token.

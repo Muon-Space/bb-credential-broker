@@ -11,10 +11,10 @@ import (
 	"testing"
 	"time"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/audit"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/auth"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/handlers"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/policy"
+	"github.com/Muon-Space/bb-credential-broker/pkg/audit"
+	"github.com/Muon-Space/bb-credential-broker/pkg/auth"
+	"github.com/Muon-Space/bb-credential-broker/pkg/handlers"
+	"github.com/Muon-Space/bb-credential-broker/pkg/policy"
 )
 
 // recordingLogger captures the order and content of audit-log

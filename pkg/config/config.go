@@ -17,10 +17,10 @@ import (
 
 	"github.com/google/go-jsonnet"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/auth"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/policy"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/secrets"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/store"
+	"github.com/Muon-Space/bb-credential-broker/pkg/auth"
+	"github.com/Muon-Space/bb-credential-broker/pkg/policy"
+	"github.com/Muon-Space/bb-credential-broker/pkg/secrets"
+	"github.com/Muon-Space/bb-credential-broker/pkg/store"
 )
 
 // Config is the broker's top-level configuration. Each field maps to

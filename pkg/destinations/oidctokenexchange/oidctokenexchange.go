@@ -30,7 +30,7 @@ import (
 	"strings"
 	"time"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/destinations/httptokenexchange"
+	"github.com/Muon-Space/bb-credential-broker/pkg/destinations/httptokenexchange"
 )
 
 // Default values that operators can omit from their configuration.

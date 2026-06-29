@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/audit"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/auth"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/destinations"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/handlers"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/store"
+	"github.com/Muon-Space/bb-credential-broker/pkg/audit"
+	"github.com/Muon-Space/bb-credential-broker/pkg/auth"
+	"github.com/Muon-Space/bb-credential-broker/pkg/destinations"
+	"github.com/Muon-Space/bb-credential-broker/pkg/handlers"
+	"github.com/Muon-Space/bb-credential-broker/pkg/store"
 )
 
 // stubDestination returns the configured token (or error) on Mint.

@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/auth"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/destinations/httptokenexchange/template"
+	"github.com/Muon-Space/bb-credential-broker/pkg/auth"
+	"github.com/Muon-Space/bb-credential-broker/pkg/destinations/httptokenexchange/template"
 )
 
 // fixedTime returns a constant time so that ${now} expansions are

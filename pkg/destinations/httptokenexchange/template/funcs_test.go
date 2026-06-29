@@ -14,10 +14,10 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/auth"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/destinations/httptokenexchange/template"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/secrets"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/signer"
+	"github.com/Muon-Space/bb-credential-broker/pkg/auth"
+	"github.com/Muon-Space/bb-credential-broker/pkg/destinations/httptokenexchange/template"
+	"github.com/Muon-Space/bb-credential-broker/pkg/secrets"
+	"github.com/Muon-Space/bb-credential-broker/pkg/signer"
 )
 
 func TestFile_ReadsFromDisk(t *testing.T) {

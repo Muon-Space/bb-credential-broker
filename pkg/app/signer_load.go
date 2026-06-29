@@ -5,8 +5,8 @@ import (
 	"log/slog"
 	"time"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/secrets"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/signer"
+	"github.com/Muon-Space/bb-credential-broker/pkg/secrets"
+	"github.com/Muon-Space/bb-credential-broker/pkg/signer"
 )
 
 // brokerSignerLoadAttempts is the maximum number of times the

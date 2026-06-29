@@ -13,8 +13,8 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/auth"
-	"muonspace.ghe.com/Muon-Space/bb-credential-broker/pkg/store"
+	"github.com/Muon-Space/bb-credential-broker/pkg/auth"
+	"github.com/Muon-Space/bb-credential-broker/pkg/store"
 )
 
 // signedKey returns a deterministic key suitable for tests. It is
