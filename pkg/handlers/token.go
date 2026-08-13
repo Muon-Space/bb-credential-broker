@@ -107,7 +107,7 @@ func (h *TokenHandler) serve(w http.ResponseWriter, r *http.Request) (int, strin
 		return http.StatusMethodNotAllowed, "", ""
 	}
 	if !h.sourceAllowed(r) {
-		h.recordTokenFailure(r, nil, "", "", denialSourceNotPermitted, nil)
+		h.recordTokenFailure(r, nil, "", "", "", denialSourceNotPermitted, nil)
 		http.Error(w, "source address is not permitted", http.StatusUnauthorized)
 		return http.StatusUnauthorized, "", ""
 	}
@@ -116,12 +116,12 @@ func (h *TokenHandler) serve(w http.ResponseWriter, r *http.Request) (int, strin
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
-		h.recordTokenFailure(r, nil, "", "", denialTokenMalformedBody, nil)
+		h.recordTokenFailure(r, nil, "", "", "", denialTokenMalformedBody, nil)
 		http.Error(w, "malformed request body", http.StatusBadRequest)
 		return http.StatusBadRequest, "", ""
 	}
 	if req.Nonce == "" || req.Destination == "" {
-		h.recordTokenFailure(r, nil, "", req.Destination, denialNonceOrDestEmpty, nil)
+		h.recordTokenFailure(r, nil, "", req.Destination, "", denialNonceOrDestEmpty, nil)
 		http.Error(w, "nonce and destination are required", http.StatusBadRequest)
 		return http.StatusBadRequest, "", req.Destination
 	}
@@ -135,24 +135,24 @@ func (h *TokenHandler) serve(w http.ResponseWriter, r *http.Request) (int, strin
 			// expiry from active forgery attempts. The
 			// HTTP response stays opaque so callers cannot
 			// probe.
-			h.recordTokenFailure(r, nil, "", req.Destination, denialNonceInvalid+": "+err.Error(), nil)
+			h.recordTokenFailure(r, nil, "", req.Destination, "", denialNonceInvalid+": "+err.Error(), nil)
 			http.Error(w, "nonce is not valid", http.StatusGone)
 			return http.StatusGone, "", req.Destination
 		}
-		h.recordTokenFailure(r, nil, "", req.Destination, "claim error: "+err.Error(), nil)
+		h.recordTokenFailure(r, nil, "", req.Destination, "", "claim error: "+err.Error(), nil)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return http.StatusInternalServerError, "", req.Destination
 	}
 	identityType := string(rec.Identity.Type)
 	if !rec.AllowsDestination(req.Destination) {
-		h.recordTokenFailure(r, rec.Identity, identityType, req.Destination, denialDestinationNotInNonce, nil)
+		h.recordTokenFailure(r, rec.Identity, identityType, req.Destination, rec.JTI, denialDestinationNotInNonce, nil)
 		http.Error(w, "destination is not granted by this nonce", http.StatusForbidden)
 		return http.StatusForbidden, identityType, req.Destination
 	}
 
 	dest := h.registry.Lookup(req.Destination)
 	if dest == nil {
-		h.recordTokenFailure(r, rec.Identity, identityType, req.Destination, denialDestinationNotKnown, nil)
+		h.recordTokenFailure(r, rec.Identity, identityType, req.Destination, rec.JTI, denialDestinationNotKnown, nil)
 		http.Error(w, "destination is not configured", http.StatusNotFound)
 		return http.StatusNotFound, identityType, req.Destination
 	}
@@ -165,12 +165,12 @@ func (h *TokenHandler) serve(w http.ResponseWriter, r *http.Request) (int, strin
 
 	tok, err := dest.Mint(ctx, rec.Identity)
 	if err != nil {
-		h.recordTokenFailure(r, rec.Identity, identityType, req.Destination, denialDestinationMintFailed+": "+err.Error(), mintAudit)
+		h.recordTokenFailure(r, rec.Identity, identityType, req.Destination, rec.JTI, denialDestinationMintFailed+": "+err.Error(), mintAudit)
 		http.Error(w, "destination mint failed", http.StatusBadGateway)
 		return http.StatusBadGateway, identityType, req.Destination
 	}
 
-	h.recordTokenSuccess(r, rec.Identity, req.Destination, tok, mintAudit)
+	h.recordTokenSuccess(r, rec.Identity, req.Destination, rec.JTI, tok, mintAudit)
 	writeJSON(w, http.StatusOK, tokenResponse{
 		Token:     tok.Value,
 		ExpiresAt: tok.ExpiresAt,
@@ -210,17 +210,18 @@ func (h *TokenHandler) sourceAllowed(r *http.Request) bool {
 // are propagated into the entry.
 //
 //nolint:revive // argument count mirrors the shape of the entry
-func (h *TokenHandler) recordTokenFailure(r *http.Request, identity *auth.Identity, identityType, destination, reason string, mintAudit *audit.MintAudit) {
+func (h *TokenHandler) recordTokenFailure(r *http.Request, identity *auth.Identity, identityType, destination, jti, reason string, mintAudit *audit.MintAudit) {
 	if h.audit == nil {
 		return
 	}
 	_ = identityType // recorded via the metrics layer at ServeHTTP; preserved in the signature for symmetry with recordTokenSuccess.
 	entry := audit.TokenEntry{
-		Time:         h.now(),
-		Identity:     toIdentityRecord(identity),
-		Destination:  destination,
-		Result:       audit.ResultFailure,
-		DenialReason: reason,
+		Time:             h.now(),
+		Identity:         toIdentityRecord(identity),
+		Destination:      destination,
+		RedeemedTokenJTI: jti,
+		Result:           audit.ResultFailure,
+		DenialReason:     reason,
 	}
 	applyMintAudit(&entry, mintAudit)
 	h.audit.LogToken(r.Context(), entry)
@@ -229,15 +230,16 @@ func (h *TokenHandler) recordTokenFailure(r *http.Request, identity *auth.Identi
 // recordTokenSuccess emits one TokenEntry with result="success"
 // and the minted token's expiry, along with whatever upstream
 // metadata the destination populated.
-func (h *TokenHandler) recordTokenSuccess(r *http.Request, identity *auth.Identity, destination string, tok *destinations.Token, mintAudit *audit.MintAudit) {
+func (h *TokenHandler) recordTokenSuccess(r *http.Request, identity *auth.Identity, destination, jti string, tok *destinations.Token, mintAudit *audit.MintAudit) {
 	if h.audit == nil {
 		return
 	}
 	entry := audit.TokenEntry{
-		Time:        h.now(),
-		Identity:    toIdentityRecord(identity),
-		Destination: destination,
-		Result:      audit.ResultSuccess,
+		Time:             h.now(),
+		Identity:         toIdentityRecord(identity),
+		Destination:      destination,
+		RedeemedTokenJTI: jti,
+		Result:           audit.ResultSuccess,
 	}
 	if !tok.ExpiresAt.IsZero() {
 		exp := tok.ExpiresAt

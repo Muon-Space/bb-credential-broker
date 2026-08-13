@@ -196,6 +196,50 @@ func TestToken_HappyPath(t *testing.T) {
 	}
 }
 
+// TestToken_SuccessEntryCarriesRedeemedJTI proves the audit join: the
+// jti /delegate assigned when it minted the nonce reappears on the
+// /token audit entry that redeemed it, so the two log lines can be
+// joined without any other shared field.
+func TestToken_SuccessEntryCarriesRedeemedJTI(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t, time.Minute)
+	mintRec := &store.Record{
+		Identity:            &auth.Identity{Type: auth.IdentityTypeCI, Principal: "p"},
+		AllowedDestinations: []string{"alpha"},
+	}
+	nonce, err := s.Mint(mintRec)
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	if mintRec.JTI == "" {
+		t.Fatal("Mint did not populate JTI")
+	}
+
+	rec := &recordingLogger{}
+	h := handlers.NewTokenHandler(
+		[]*net.IPNet{mustCIDR(t, "10.0.0.0/8")},
+		s,
+		destinations.Registry{"alpha": &stubDestination{token: &destinations.Token{Value: "abc", Scheme: "bearer"}}},
+		rec,
+		nil,
+	)
+	r := httptest.NewRequest(http.MethodPost, "/token",
+		strings.NewReader(`{"nonce":"`+nonce+`","destination":"alpha"}`))
+	r.RemoteAddr = "10.0.0.42:12345"
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want %d (body=%s)", w.Code, http.StatusOK, w.Body.String())
+	}
+	if len(rec.token) != 1 {
+		t.Fatalf("audit calls: got %d, want 1", len(rec.token))
+	}
+	if got := rec.token[0].RedeemedTokenJTI; got != mintRec.JTI {
+		t.Errorf("RedeemedTokenJTI: got %q, want %q (the jti /delegate minted)", got, mintRec.JTI)
+	}
+}
+
 // TestToken_ClaimFailureAuditCarriesReason proves that when Claim
 // rejects a token, the underlying reason (expired, bad signature,
 // etc.) is preserved in the audit-log Error field while the HTTP
@@ -231,6 +275,9 @@ func TestToken_ClaimFailureAuditCarriesReason(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "expired") {
 		t.Errorf("audit log must carry the underlying reason: %s", buf.String())
+	}
+	if strings.Contains(buf.String(), "redeemed_token_jti") {
+		t.Errorf("a failed claim has no verified jti to report: %s", buf.String())
 	}
 }
 

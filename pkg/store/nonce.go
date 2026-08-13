@@ -45,9 +45,11 @@ type Record struct {
 	// JTI is the unique identifier the backend assigned to the
 	// issued token. NonceStore.Mint populates this field before
 	// returning so the /delegate audit log entry can reference
-	// the specific token issued. The field is audit-only and
-	// carries no security significance; it is left empty by
-	// NonceStore.Claim.
+	// the specific token issued; NonceStore.Claim populates it by
+	// reading the token's own jti claim back out, so the /token
+	// audit log entry can reference the same identifier and join
+	// the two log entries. The field is audit-only and carries no
+	// security significance.
 	JTI string
 }
 
