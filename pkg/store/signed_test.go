@@ -160,6 +160,11 @@ func TestSignedStore_MintClaim(t *testing.T) {
 			t.Errorf("AllowedDestinations[%d]: got %q, want %q", i, got.AllowedDestinations[i], d)
 		}
 	}
+	// Claim must read the jti back out of the token so /token's audit
+	// entry can be joined to the /delegate entry that minted it.
+	if got.JTI != rec.JTI {
+		t.Errorf("Claim JTI: got %q, want %q (the JTI Mint assigned)", got.JTI, rec.JTI)
+	}
 }
 
 // TestSignedStore_MintAssignsUniqueJTI confirms that consecutive

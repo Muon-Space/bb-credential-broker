@@ -95,17 +95,25 @@ type DelegateEntry struct {
 // type). UpstreamResponseExcerpt is populated only on upstream
 // failure and is bounded to a small prefix.
 type TokenEntry struct {
-	Time                    time.Time       `json:"ts"`
-	Event                   string          `json:"event"`
-	Identity                *IdentityRecord `json:"identity"`
-	Destination             string          `json:"destination,omitempty"`
-	Result                  string          `json:"result"`
-	DenialReason            string          `json:"denial_reason,omitempty"`
-	UpstreamURL             string          `json:"upstream_url,omitempty"`
-	UpstreamStatus          int             `json:"upstream_status,omitempty"`
-	UpstreamDurationMS      int64           `json:"upstream_duration_ms,omitempty"`
-	UpstreamResponseExcerpt string          `json:"upstream_response_excerpt,omitempty"`
-	TokenExpiresAt          *time.Time      `json:"token_expires_at,omitempty"`
+	Time        time.Time       `json:"ts"`
+	Event       string          `json:"event"`
+	Identity    *IdentityRecord `json:"identity"`
+	Destination string          `json:"destination,omitempty"`
+	// RedeemedTokenJTI is the jti of the delegation token this
+	// request claimed, joining this entry back to the DelegateEntry
+	// that minted it. Populated whenever the nonce itself was
+	// successfully claimed, regardless of what happened afterward
+	// (destination rejection, mint failure, or success); empty only
+	// when the claim itself failed (denial_reason explains why, and
+	// there is no verified token to name).
+	RedeemedTokenJTI        string     `json:"redeemed_token_jti,omitempty"`
+	Result                  string     `json:"result"`
+	DenialReason            string     `json:"denial_reason,omitempty"`
+	UpstreamURL             string     `json:"upstream_url,omitempty"`
+	UpstreamStatus          int        `json:"upstream_status,omitempty"`
+	UpstreamDurationMS      int64      `json:"upstream_duration_ms,omitempty"`
+	UpstreamResponseExcerpt string     `json:"upstream_response_excerpt,omitempty"`
+	TokenExpiresAt          *time.Time `json:"token_expires_at,omitempty"`
 }
 
 // Logger is the interface the handlers depend on for audit-log

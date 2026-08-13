@@ -226,6 +226,14 @@ func (s *SignedStore) Claim(token string) (*Record, error) {
 		}
 	}
 
+	// jti is a standard claim (RFC 7519), but MapClaims exposes no
+	// typed accessor for it; read it the same way as the other
+	// custom claims above. Its presence is guaranteed by Mint, not
+	// enforced by the parser, so a missing or non-string value
+	// degrades to an empty JTI rather than a claim failure — the
+	// token is still valid, only the audit join is weaker.
+	jti, _ := claims["jti"].(string)
+
 	return &Record{
 		Identity: &auth.Identity{
 			Type:      auth.IdentityType(identityType),
@@ -234,6 +242,7 @@ func (s *SignedStore) Claim(token string) (*Record, error) {
 		},
 		AllowedDestinations: destinations,
 		ExpiresAt:           exp.Time,
+		JTI:                 jti,
 	}, nil
 }
 
