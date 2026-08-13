@@ -77,15 +77,22 @@ func (o *orderingResponseWriter) WriteHeader(code int) {
 	o.inner.WriteHeader(code)
 }
 
-// fakeValidator is a BearerValidator that returns the configured
-// Identity when token == "good", and an error otherwise.
+// fakeValidator is a BearerValidator that returns identity for
+// token == "good", actorIdentity for token == "actor-good" (when
+// set), and an error for anything else.
 type fakeValidator struct {
-	identity *auth.Identity
+	identity      *auth.Identity
+	actorIdentity *auth.Identity
 }
 
 func (f *fakeValidator) ValidateBearer(token string) (*auth.Identity, error) {
-	if token == "good" {
+	switch token {
+	case "good":
 		return f.identity, nil
+	case "actor-good":
+		if f.actorIdentity != nil {
+			return f.actorIdentity, nil
+		}
 	}
 	return nil, errors.New("invalid token")
 }
@@ -318,6 +325,90 @@ func TestDelegate_GrantedEntryCarriesJTIAndExp(t *testing.T) {
 	}
 	if entry.Identity == nil || entry.Identity.Claims["repository"] != "owner/repo" {
 		t.Errorf("Identity claims missing repository: %+v", entry.Identity)
+	}
+}
+
+// TestDelegate_ActorTokenCarriedIntoGrantAndAudit proves the RFC
+// 8693 delegation path end to end: a validated actor_token reaches
+// the minted grant (via SignedStore's "act" claim, checked by a
+// full Mint/Claim round trip) and the /delegate audit entry, without
+// changing whose Identity the grant is issued to.
+func TestDelegate_ActorTokenCarriedIntoGrantAndAudit(t *testing.T) {
+	t.Parallel()
+	subject := &auth.Identity{Type: auth.IdentityTypeCI, Principal: "repo:owner/repo:ref:refs/heads/main"}
+	actor := &auth.Identity{Type: auth.IdentityTypeUser, Principal: "system:serviceaccount:bazel-cache:bb-storage"}
+	rec := &recordingLogger{}
+	s := newTestStore(t, time.Minute)
+	h := handlers.NewDelegateHandler(
+		&fakeValidator{identity: subject, actorIdentity: actor},
+		&fakePolicy{allowed: []string{"alpha"}},
+		s,
+		rec,
+		nil,
+	)
+
+	r := httptest.NewRequest(http.MethodPost, "/delegate",
+		strings.NewReader(`{"requested_destinations":["alpha"],"actor_token":"actor-good"}`))
+	r.Header.Set("Authorization", "Bearer good")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200 (body=%s)", w.Code, w.Body.String())
+	}
+	if len(rec.delegate) != 1 {
+		t.Fatalf("audit calls: got %d, want 1", len(rec.delegate))
+	}
+	entry := rec.delegate[0]
+	if entry.ActorPrincipal != actor.Principal {
+		t.Errorf("ActorPrincipal: got %q, want %q", entry.ActorPrincipal, actor.Principal)
+	}
+	if entry.Identity == nil || entry.Identity.Principal != subject.Principal {
+		t.Errorf("Identity: got %+v, want subject %q (actor_token must not change who the grant is for)", entry.Identity, subject.Principal)
+	}
+
+	var resp struct {
+		Nonce string `json:"nonce"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	claimed, err := s.Claim(resp.Nonce)
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if claimed.Actor == nil || claimed.Actor.Principal != actor.Principal {
+		t.Errorf("Claim did not round-trip the actor: got %+v", claimed.Actor)
+	}
+}
+
+// TestDelegate_RejectsInvalidActorToken proves an actor_token that
+// fails validation denies the whole request, the same as an invalid
+// primary bearer, rather than silently minting without an actor.
+func TestDelegate_RejectsInvalidActorToken(t *testing.T) {
+	t.Parallel()
+	rec := &recordingLogger{}
+	h := handlers.NewDelegateHandler(
+		&fakeValidator{identity: &auth.Identity{Type: auth.IdentityTypeCI, Principal: "p"}},
+		&fakePolicy{allowed: []string{"alpha"}},
+		newTestStore(t, time.Minute),
+		rec,
+		nil,
+	)
+	r := httptest.NewRequest(http.MethodPost, "/delegate",
+		strings.NewReader(`{"requested_destinations":["alpha"],"actor_token":"garbage"}`))
+	r.Header.Set("Authorization", "Bearer good")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status: got %d, want %d", w.Code, http.StatusUnauthorized)
+	}
+	if len(rec.delegate) != 1 || rec.delegate[0].Result != audit.ResultDenied {
+		t.Fatalf("audit entry: got %+v, want one ResultDenied entry", rec.delegate)
+	}
+	if !strings.Contains(rec.delegate[0].DenialReason, "actor_token") {
+		t.Errorf("DenialReason: got %q, want it to name actor_token", rec.delegate[0].DenialReason)
 	}
 }
 

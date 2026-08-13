@@ -71,11 +71,15 @@ type IdentityRecord struct {
 // Identity is nil for requests rejected before identity resolution
 // (typically a bearer-token failure); GrantedDestinations,
 // DelegationTokenJTI and DelegationTokenExp are populated only
-// when Result is ResultGranted.
+// when Result is ResultGranted. ActorPrincipal is populated only
+// when the request carried a validated actor_token (RFC 8693): it
+// names the party that minted the grant on Identity's behalf,
+// distinct from Identity itself.
 type DelegateEntry struct {
 	Time                time.Time       `json:"ts"`
 	Event               string          `json:"event"`
 	Identity            *IdentityRecord `json:"identity"`
+	ActorPrincipal      string          `json:"actor_principal,omitempty"`
 	Result              string          `json:"result"`
 	DenialReason        string          `json:"denial_reason,omitempty"`
 	GrantedDestinations []string        `json:"granted_destinations,omitempty"`

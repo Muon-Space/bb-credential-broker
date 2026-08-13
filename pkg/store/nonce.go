@@ -32,6 +32,17 @@ type Record struct {
 	// downstream requests can carry per-build attribution.
 	Identity *auth.Identity
 
+	// Actor is the identity of the party that presented an
+	// actor_token alongside the subject bearer at /delegate,
+	// per RFC 8693 (OAuth 2.0 Token Exchange) delegation
+	// semantics: Identity is "acts as" Actor, not Actor
+	// impersonating Identity. Nil when the request carried no
+	// actor_token, which is the common case for a client minting
+	// its own grant directly. SignedStore.Mint embeds this as the
+	// token's "act" claim; SignedStore.Claim reads it back so
+	// /token's audit entry can also show the actor.
+	Actor *auth.Identity
+
 	// AllowedDestinations is the set of destination names the
 	// policy engine permitted at /delegate time. /token rejects
 	// any destination outside this set.
