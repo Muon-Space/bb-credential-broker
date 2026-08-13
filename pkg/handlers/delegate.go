@@ -62,14 +62,15 @@ func NewDelegateHandler(parser BearerValidator, p policy.Engine, n store.NonceSt
 // They are part of the published log schema; downstream queries
 // pivot on them.
 const (
-	denialMissingAuthorization     = "missing or malformed Authorization header"
-	denialJWTValidationFailed      = "jwt validation failed"
-	denialMalformedRequestBody     = "malformed request body"
-	denialEmptyRequestedSet        = "requested_destinations must not be empty"
-	denialPolicyResolutionError    = "policy resolution error"
-	denialNoPolicyEntryMatched     = "no policy entry matched identity"
-	denialDestinationNotInGrantSet = "requested destination not in granted set"
-	denialNonceMintFailed          = "nonce mint failed"
+	denialMissingAuthorization       = "missing or malformed Authorization header"
+	denialJWTValidationFailed        = "jwt validation failed"
+	denialMalformedRequestBody       = "malformed request body"
+	denialEmptyRequestedSet          = "requested_destinations must not be empty"
+	denialActorTokenValidationFailed = "actor_token validation failed"
+	denialPolicyResolutionError      = "policy resolution error"
+	denialNoPolicyEntryMatched       = "no policy entry matched identity"
+	denialDestinationNotInGrantSet   = "requested destination not in granted set"
+	denialNonceMintFailed            = "nonce mint failed"
 )
 
 // destinationWildcard is the sentinel a caller places in
@@ -90,6 +91,15 @@ type delegateRequest struct {
 	// identity is entitled to — the caller never has to know the
 	// destination names.
 	RequestedDestinations []string `json:"requested_destinations"`
+
+	// ActorToken is an optional bearer JWT identifying the party
+	// minting this grant on behalf of the caller identified by the
+	// Authorization header, per RFC 8693 (OAuth 2.0 Token
+	// Exchange) delegation semantics. Validated with the same
+	// BearerValidator as the primary bearer, so it must be issued
+	// by a configured jwtAuth issuer. Absent for the common case
+	// of a caller minting its own grant directly.
+	ActorToken string `json:"actor_token,omitempty"`
 }
 
 // delegateResponse is the JSON body /delegate returns on success.
@@ -157,6 +167,23 @@ func (h *DelegateHandler) serve(w http.ResponseWriter, r *http.Request) (int, st
 		return http.StatusBadRequest, identityType
 	}
 
+	// An actor_token identifies a party minting this grant on the
+	// caller's behalf (RFC 8693). Validated the same way as the
+	// primary bearer: it must come from a configured jwtAuth
+	// issuer. A frontend presenting its own identity here is the
+	// only sanctioned use today; policy.jsonnet is what actually
+	// restricts who may do so, not this check.
+	var actor *auth.Identity
+	if req.ActorToken != "" {
+		var err error
+		actor, err = h.parser.ValidateBearer(req.ActorToken)
+		if err != nil {
+			h.recordDenial(r, identity, denialActorTokenValidationFailed+": "+err.Error())
+			http.Error(w, "unauthenticated", http.StatusUnauthorized)
+			return http.StatusUnauthorized, identityType
+		}
+	}
+
 	allowed, err := h.policy.Resolve(identity)
 	if err != nil {
 		h.recordDenial(r, identity, denialPolicyResolutionError+": "+err.Error())
@@ -202,6 +229,7 @@ func (h *DelegateHandler) serve(w http.ResponseWriter, r *http.Request) (int, st
 	// names the issued token by.
 	rec := &store.Record{
 		Identity:            identity,
+		Actor:               actor,
 		AllowedDestinations: granted,
 	}
 	nonce, err := h.nonces.Mint(rec)
@@ -242,9 +270,14 @@ func (h *DelegateHandler) recordGrant(r *http.Request, identity *auth.Identity, 
 		return
 	}
 	exp := rec.ExpiresAt
+	var actorPrincipal string
+	if rec.Actor != nil {
+		actorPrincipal = rec.Actor.Principal
+	}
 	h.audit.LogDelegate(r.Context(), audit.DelegateEntry{
 		Time:                h.now(),
 		Identity:            toIdentityRecord(identity),
+		ActorPrincipal:      actorPrincipal,
 		Result:              audit.ResultGranted,
 		GrantedDestinations: granted,
 		DelegationTokenJTI:  rec.JTI,

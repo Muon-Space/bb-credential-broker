@@ -28,6 +28,11 @@ const (
 	claimIdentityType        = "identity_type"
 	claimIdentityClaims      = "claims"
 	claimGrantedDestinations = "granted_destinations"
+	// claimActor is the RFC 8693 "act" claim: a JSON object naming
+	// the party the subject is "acting as", carrying at minimum a
+	// "sub" member. Present only when the /delegate request carried
+	// an actor_token.
+	claimActor = "act"
 )
 
 // SignedConfig configures the SignedStore backend.
@@ -167,6 +172,14 @@ func (s *SignedStore) Mint(rec *Record) (string, error) {
 		claimIdentityClaims:      rec.Identity.Claims,
 		claimGrantedDestinations: rec.AllowedDestinations,
 	}
+	if rec.Actor != nil {
+		// RFC 8693 section 4.1: "act" is a JSON object whose "sub"
+		// member identifies the acting party. rec.Identity.Principal
+		// (the "sub" claim above) stays the subject the grant is
+		// FOR; this claim records who minted it ON BEHALF OF that
+		// subject, closing the impersonation gap phase 1 accepted.
+		claims[claimActor] = map[string]any{"sub": rec.Actor.Principal}
+	}
 	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	signed, err := tok.SignedString(s.key)
 	if err != nil {
@@ -234,12 +247,25 @@ func (s *SignedStore) Claim(token string) (*Record, error) {
 	// token is still valid, only the audit join is weaker.
 	jti, _ := claims["jti"].(string)
 
+	// act, when present, names the party that minted this token on
+	// the subject's behalf (RFC 8693). A malformed or missing "sub"
+	// inside it degrades to a nil Actor rather than a claim failure,
+	// same treatment as the other optional claims above: the token
+	// itself is still valid.
+	var actor *auth.Identity
+	if rawAct, ok := claims[claimActor].(map[string]any); ok {
+		if actorSub, ok := rawAct["sub"].(string); ok && actorSub != "" {
+			actor = &auth.Identity{Principal: actorSub}
+		}
+	}
+
 	return &Record{
 		Identity: &auth.Identity{
 			Type:      auth.IdentityType(identityType),
 			Principal: principal,
 			Claims:    rawClaims,
 		},
+		Actor:               actor,
 		AllowedDestinations: destinations,
 		ExpiresAt:           exp.Time,
 		JTI:                 jti,
