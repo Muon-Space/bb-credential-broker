@@ -53,6 +53,7 @@ jobs:
           echo '{"keys":[{"kid":"k1","kty":"RSA","n":"AQAB","e":"AQAB"}]}' | sudo tee /etc/jwks/okta-jwks.json >/dev/null
           sudo dd if=/dev/urandom of=/etc/broker/signing-key bs=32 count=1
           echo "x" | sudo tee /etc/broker/destinations/ghe-packages-pat >/dev/null
+          echo "x" | sudo tee /etc/broker/destinations/oci-registry-pull >/dev/null
           sudo touch /var/run/secrets/eks.amazonaws.com/serviceaccount/token
           # The broker's RSA signing key is referenced in the
           # example config but the validate path does not reach
