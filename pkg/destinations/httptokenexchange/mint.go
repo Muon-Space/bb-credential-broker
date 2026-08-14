@@ -337,7 +337,7 @@ func (i *Impl) extractExpiry(decoded any) (time.Time, error) {
 		if err != nil {
 			return time.Time{}, fmt.Errorf("expiresInJsonPath: %w", err)
 		}
-		return time.Now().Add(time.Duration(secs * float64(time.Second))), nil
+		return i.now().Add(time.Duration(secs * float64(time.Second))), nil
 	case i.expiresAtPath != nil:
 		v, err := i.expiresAtPath.Search(decoded)
 		if err != nil {

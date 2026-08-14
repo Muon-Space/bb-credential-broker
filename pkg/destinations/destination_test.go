@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -267,6 +268,92 @@ func TestBuildRegistry_StaticSecretMissingFileIsRejectedAtBuild(t *testing.T) {
 		t.Fatal("expected error for missing secret file at build time, got nil")
 	}
 	if !strings.Contains(err.Error(), "ghe-pat") {
+		t.Errorf("error %q should mention destination name", err.Error())
+	}
+}
+
+// TestBuildRegistry_RegistryTokenExchangeHappyPath exercises the
+// registryTokenExchange dispatch end to end: the constructed
+// destination performs the two-legged Basic-auth-to-bearer-token
+// exchange against a fake token endpoint and dispenses the opaque
+// bearer token with scheme "bearer" and no username, matching the
+// response shape of every other bearer-token destination. A second
+// Mint within the token's lifetime must be served from the generic
+// identity-invariant cache BuildRegistry wraps this type in, without
+// a second upstream exchange.
+func TestBuildRegistry_RegistryTokenExchangeHappyPath(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "secret")
+	if err := os.WriteFile(path, []byte("s3cr3t"), 0o600); err != nil {
+		t.Fatalf("write secret: %v", err)
+	}
+	var exchanges int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if user, pass, ok := r.BasicAuth(); !ok || user != "robot" || pass != "s3cr3t" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		atomic.AddInt32(&exchanges, 1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"token":"opaque-bearer-token","expires_in":300}`))
+	}))
+	defer srv.Close()
+
+	raw := map[string]json.RawMessage{
+		"registry": json.RawMessage(`{
+			"registryTokenExchange": {
+				"tokenUrl": "` + srv.URL + `/v2/token",
+				"service":  "registry.example.com",
+				"scope":    "repository:my-repo:pull",
+				"username": "robot",
+				"file":     "` + path + `"
+			}
+		}`),
+	}
+	reg, err := destinations.BuildRegistry(raw, destinations.Dependencies{})
+	if err != nil {
+		t.Fatalf("BuildRegistry: %v", err)
+	}
+	tok, err := reg.Lookup("registry").Mint(context.Background(),
+		&auth.Identity{Type: auth.IdentityTypeCI, Principal: "p"})
+	if err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+	if tok.Value != "opaque-bearer-token" {
+		t.Errorf("Value: got %q, want %q", tok.Value, "opaque-bearer-token")
+	}
+	if tok.Scheme != "bearer" {
+		t.Errorf("Scheme: got %q, want %q", tok.Scheme, "bearer")
+	}
+	if tok.Username != "" {
+		t.Errorf("Username: got %q, want empty", tok.Username)
+	}
+
+	if _, err := reg.Lookup("registry").Mint(context.Background(),
+		&auth.Identity{Type: auth.IdentityTypeCI, Principal: "p"}); err != nil {
+		t.Fatalf("Mint #2: %v", err)
+	}
+	if got := atomic.LoadInt32(&exchanges); got != 1 {
+		t.Errorf("upstream exchange count: got %d, want 1 (second Mint should be served from the cache)", got)
+	}
+}
+
+func TestBuildRegistry_RegistryTokenExchangeMissingFileIsRejectedAtBuild(t *testing.T) {
+	t.Parallel()
+	raw := map[string]json.RawMessage{
+		"registry": json.RawMessage(`{
+			"registryTokenExchange": {
+				"tokenUrl": "https://example.com/v2/token",
+				"username": "robot",
+				"file":     "/does/not/exist"
+			}
+		}`),
+	}
+	_, err := destinations.BuildRegistry(raw, destinations.Dependencies{})
+	if err == nil {
+		t.Fatal("expected error for missing secret file at build time, got nil")
+	}
+	if !strings.Contains(err.Error(), "registry") {
 		t.Errorf("error %q should mention destination name", err.Error())
 	}
 }

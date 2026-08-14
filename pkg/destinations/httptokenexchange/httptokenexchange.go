@@ -196,6 +196,7 @@ type Impl struct {
 	usernameClaimPath *jmespath.JMESPath
 
 	client *http.Client
+	now    func() time.Time
 }
 
 // parsedHeader pairs a key template with its value template. We
@@ -245,6 +246,7 @@ func New(name string, cfg *Config, deps Dependencies) (*Impl, error) {
 		parsedURL:     parsedURL,
 		parsedHeaders: headers,
 		client:        deps.HTTPClient,
+		now:           time.Now,
 	}
 	if out.client == nil {
 		out.client = &http.Client{Timeout: requestTimeout}
@@ -531,3 +533,11 @@ type Token struct {
 // mints to the configured name without the caller threading the
 // name through every call site.
 func (i *Impl) Name() string { return i.name }
+
+// SetNow overrides the function used to read the current time when
+// converting a relative expires_in expiry into the absolute
+// ExpiresAt stamped on the minted Token. It exists so that tests
+// (of this package and of destination types layered on it) can
+// assert expiry arithmetic at a specific instant; production
+// callers should not invoke it.
+func (i *Impl) SetNow(f func() time.Time) { i.now = f }
