@@ -223,7 +223,13 @@ func buildOne(name string, msg json.RawMessage, deps Dependencies) (Destination,
 		if err != nil {
 			return nil, err
 		}
-		return &registryTokenExchangeAdapter{impl: impl}, nil
+		// The registry exchange authenticates with a fixed
+		// operator-supplied credential, so its mint flow is
+		// identity-invariant and the generic cache applies: every
+		// caller shares the exchanged token until shortly before
+		// its reported expiry, and concurrent misses collapse to a
+		// single exchange against the registry's token endpoint.
+		return newCachedDestination(&registryTokenExchangeAdapter{impl: impl}), nil
 	default:
 		return nil, fmt.Errorf("no destination type discriminator set; expected one of: httpTokenExchange, staticSecret, oidcTokenExchange, registryTokenExchange")
 	}

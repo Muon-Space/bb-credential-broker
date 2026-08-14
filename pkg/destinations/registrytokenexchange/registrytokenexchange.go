@@ -23,23 +23,23 @@
 // response-size limiting, status validation, JSON decoding, JMESPath
 // extraction and audit-log population are all the existing,
 // already-tested httptokenexchange machinery. The only genuinely new
-// pieces are:
+// piece is a RoundTripper that injects a fresh, correctly RFC
+// 7617-encoded HTTP Basic Authorization header (username plus a
+// secret read from disk) into the outbound request. The broker's
+// own ${b64:...} template function base64url-encodes without
+// padding for an unrelated use case and would produce a header most
+// registries reject, so this type does not route the credential
+// through the shared template engine.
 //
-//   - A RoundTripper that injects a fresh, correctly RFC 7617-encoded
-//     HTTP Basic Authorization header (username plus a secret read
-//     from disk) into the outbound request. The broker's own
-//     ${b64:...} template function base64url-encodes without
-//     padding for an unrelated use case and would produce a header
-//     most registries reject, so this type does not route the
-//     credential through the shared template engine.
-//   - A short-lived, singleflight-guarded cache in front of the
-//     exchange, because the opaque bearer token this flow returns is
-//     typically valid for as little as 60 seconds and the exchange
-//     is not identity-scoped: every caller of a given destination
-//     gets the same token, so sharing one cached value across
-//     concurrent /token requests produces a single exchange call
-//     against the registry's token endpoint rather than one per
-//     request.
+// The exchange is not identity-scoped — it authenticates with a
+// fixed operator-supplied credential, so every caller of a given
+// destination receives the same token — and the returned token is
+// typically valid for as little as 60 seconds. The parent
+// destinations package therefore wraps this type in its generic
+// identity-invariant cache, which relies on every minted Token
+// carrying a non-zero expiry; the compiled configuration guarantees
+// that by defaulting expires_in to the configured cacheTtl whenever
+// the response omits it.
 package registrytokenexchange
 
 import (
@@ -49,7 +49,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/Muon-Space/bb-credential-broker/pkg/auth"
@@ -69,14 +68,6 @@ const requestTimeout = 30 * time.Second
 // permits omitting expires_in; 60 seconds is the commonly used
 // default lifetime in that case.
 const DefaultCacheTTL = 60 * time.Second
-
-// refreshSkew is how long before the cached token's reported expiry
-// the cache treats it as stale and re-exchanges. Mirrors the
-// refreshSkew convention in pkg/egressauthd's client-side token
-// cache, sized down from that cache's 30s because the tokens this
-// destination caches are themselves often as short-lived as 60s
-// total; a 30s skew would halve the usable window.
-const refreshSkew = 5 * time.Second
 
 // Config configures a single named registryTokenExchange
 // destination.
@@ -129,25 +120,14 @@ type Token struct {
 	ExpiresAt time.Time
 }
 
-// cachedToken is a stored Token plus the absolute time at which the
-// cache should re-exchange.
-type cachedToken struct {
-	token     *Token
-	refreshAt time.Time
-}
-
 // Impl is a single instance of the registryTokenExchange destination
 // type. Exchanges are delegated to an inner httptokenexchange.Impl;
-// Impl itself owns only the response cache and the singleflight
-// guard in front of it.
+// Impl itself owns only the Basic-auth transport wiring. Caching of
+// the exchanged token is provided by the parent destinations
+// package's identity-invariant cache, not here.
 type Impl struct {
 	name  string
 	inner *httptokenexchange.Impl
-	now   func() time.Time
-
-	mu       sync.Mutex
-	cached   *cachedToken
-	inflight *sync.WaitGroup
 }
 
 // New constructs an Impl from cfg. The secret file's readability is
@@ -196,7 +176,8 @@ func New(name string, cfg *Config) (*Impl, error) {
 	// "access_token" (the alias some implementations use instead).
 	// expiresInJsonPath falls back to the configured cacheTTL, in
 	// seconds, whenever the response omits expires_in, so a missing
-	// field never fails the exchange.
+	// field never fails the exchange and every minted Token carries
+	// the non-zero expiry the parent package's cache keys off.
 	httpCfg := &httptokenexchange.Config{
 		Request: httptokenexchange.RequestConfig{
 			Method: http.MethodGet,
@@ -225,7 +206,6 @@ func New(name string, cfg *Config) (*Impl, error) {
 	return &Impl{
 		name:  name,
 		inner: inner,
-		now:   time.Now,
 	}, nil
 }
 
@@ -255,57 +235,19 @@ func buildTokenURL(cfg *Config) (string, error) {
 // instance.
 func (i *Impl) Name() string { return i.name }
 
-// SetNow overrides the function used to read the current time. It
-// exists so tests can assert cache behaviour at specific instants;
+// SetNow overrides the function the inner httpTokenExchange
+// destination uses to convert the response's relative expires_in
+// into the absolute expiry stamped on the minted Token. It exists
+// so tests can assert expiry arithmetic at a specific instant;
 // production callers should not invoke it.
-func (i *Impl) SetNow(f func() time.Time) { i.now = f }
+func (i *Impl) SetNow(f func() time.Time) { i.inner.SetNow(f) }
 
-// Mint returns the cached bearer token when one is fresh, otherwise
-// performs the two-legged exchange via the inner httpTokenExchange
-// destination and caches the result.
-//
-// Concurrent misses for this destination are de-duplicated with the
-// same mutex-plus-WaitGroup pattern pkg/egressauthd's client-side
-// token cache uses: the first caller to observe a stale cache
-// performs the exchange while later callers wait on it and then
-// re-read the cache, so a burst of /token requests for this
-// destination produces a single upstream exchange call.
+// Mint performs the two-legged exchange via the inner
+// httpTokenExchange destination and returns the opaque bearer
+// token. Every call reaches the registry's token endpoint; the
+// parent destinations package's cache is what keeps a burst of
+// /token requests from repeating the exchange.
 func (i *Impl) Mint(ctx context.Context, identity *auth.Identity) (*Token, error) {
-	i.mu.Lock()
-	if tok, ok := i.freshLocked(); ok {
-		i.mu.Unlock()
-		return tok, nil
-	}
-	if wg := i.inflight; wg != nil {
-		i.mu.Unlock()
-		wg.Wait()
-		i.mu.Lock()
-		if tok, ok := i.freshLocked(); ok {
-			i.mu.Unlock()
-			return tok, nil
-		}
-		// The in-flight exchange failed or produced a still-stale
-		// entry; fall through and exchange ourselves.
-	}
-	wg := &sync.WaitGroup{}
-	wg.Add(1)
-	i.inflight = wg
-	i.mu.Unlock()
-
-	defer func() {
-		i.mu.Lock()
-		i.inflight = nil
-		i.mu.Unlock()
-		wg.Done()
-	}()
-
-	// wallNow anchors the TTL calculation below to the real clock:
-	// httptokenexchange's expiresInJsonPath extraction stamps
-	// ExpiresAt from time.Now() internally (it has no injectable
-	// clock of its own), so the only portable way to recover "how
-	// long is this token valid for" is to diff against the real
-	// time observed on this side of the same call.
-	wallNow := time.Now()
 	innerTok, err := i.inner.Mint(ctx, identity)
 	if err != nil {
 		return nil, err
@@ -313,46 +255,18 @@ func (i *Impl) Mint(ctx context.Context, identity *auth.Identity) (*Token, error
 	if innerTok.Value == "" {
 		return nil, fmt.Errorf("registryTokenExchange: %s: token endpoint response carried no token", i.name)
 	}
-
-	tok := &Token{
+	return &Token{
 		Value:     innerTok.Value,
 		ExpiresAt: innerTok.ExpiresAt,
-	}
-
-	// ttl is the token's validity window, derived from two
-	// real-clock readings taken around the same exchange call. Once
-	// known, the cache's refresh instant is re-anchored to i.now()
-	// rather than to the real clock, so that (a) tests can control
-	// cache staleness deterministically via SetNow and (b) the
-	// cache logic is entirely self-consistent even if i.now ever
-	// diverges from wall time for reasons other than testing.
-	ttl := tok.ExpiresAt.Sub(wallNow)
-	if ttl < 0 {
-		ttl = 0
-	}
-	refreshAt := i.now().Add(ttl - refreshSkew)
-
-	i.mu.Lock()
-	i.cached = &cachedToken{token: tok, refreshAt: refreshAt}
-	i.mu.Unlock()
-	return tok, nil
-}
-
-// freshLocked returns the cached token and true when one exists and
-// has not yet reached its refresh instant. Callers must hold i.mu.
-func (i *Impl) freshLocked() (*Token, bool) {
-	if i.cached != nil && i.now().Before(i.cached.refreshAt) {
-		return i.cached.token, true
-	}
-	return nil, false
+	}, nil
 }
 
 // RenderRequest builds the outbound GET request the destination
-// would exchange, without dispatching it or performing the caching
-// wrapper's dedup logic. The Authorization header is never resolved
-// for real here: the credential is injected by the RoundTripper at
-// dispatch time, not by request construction, so a redacted
-// placeholder is set instead of reading the real secret file.
+// would exchange, without dispatching it. The Authorization header
+// is never resolved for real here: the credential is injected by
+// the RoundTripper at dispatch time, not by request construction,
+// so a redacted placeholder is set instead of reading the real
+// secret file.
 func (i *Impl) RenderRequest(ctx context.Context, identity *auth.Identity) (*http.Request, error) {
 	req, err := i.inner.RenderRequest(ctx, identity)
 	if err != nil {
@@ -367,9 +281,9 @@ func (i *Impl) RenderRequest(ctx context.Context, identity *auth.Identity) (*htt
 // the paired secret from disk on each round trip. This mirrors
 // staticSecret's read-on-every-Mint convention — an operator rotating
 // the underlying Secret does not need to restart the broker — applied
-// at exchange frequency rather than dispense frequency, since Impl's
-// cache means the inner httpTokenExchange Mint (and therefore this
-// transport) only runs on a cache miss.
+// at exchange frequency rather than dispense frequency, since the
+// parent package's cache means Mint (and therefore this transport)
+// only runs on a cache miss.
 //
 // Standard net/http Basic-auth encoding (base64.StdEncoding per RFC
 // 7617, via http.Request.SetBasicAuth) is used rather than the

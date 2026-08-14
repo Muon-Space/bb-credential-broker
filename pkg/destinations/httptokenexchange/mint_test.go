@@ -151,6 +151,41 @@ func TestMint_HappyPath_RawJSONBodyAndExpiresIn(t *testing.T) {
 	}
 }
 
+// TestMint_ExpiresInUsesInjectableClock pins the expiry arithmetic
+// to the clock seam: with SetNow frozen, a relative expires_in must
+// stamp exactly frozen-instant-plus-expires_in, with no dependence
+// on the real clock.
+func TestMint_ExpiresInUsesInjectableClock(t *testing.T) {
+	t.Parallel()
+	fake := newFakeDestination(http.StatusOK, `{"access_token":"abc123","expires_in":300}`)
+	defer fake.Close()
+
+	cfg := &httptokenexchange.Config{
+		Request: httptokenexchange.RequestConfig{
+			Method: "GET",
+			URL:    fake.URL() + "/token",
+		},
+		Response: httptokenexchange.ResponseConfig{
+			TokenJSONPath:     "access_token",
+			ExpiresInJSONPath: "expires_in",
+		},
+	}
+	impl, err := httptokenexchange.New("test", cfg, newTestDeps())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	frozen := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
+	impl.SetNow(func() time.Time { return frozen })
+
+	tok, err := impl.Mint(context.Background(), newTestIdentity())
+	if err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+	if want := frozen.Add(300 * time.Second); !tok.ExpiresAt.Equal(want) {
+		t.Errorf("Token.ExpiresAt: got %v, want %v", tok.ExpiresAt, want)
+	}
+}
+
 func TestMint_HappyPath_ExpiresAtRFC3339(t *testing.T) {
 	t.Parallel()
 	expiresAt := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)

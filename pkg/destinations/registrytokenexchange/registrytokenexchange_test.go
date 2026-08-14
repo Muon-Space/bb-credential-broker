@@ -276,10 +276,13 @@ func TestMint_AcceptsAccessTokenAlias(t *testing.T) {
 	}
 }
 
-// TestMint_CachesWithinTokenLifetime confirms that a second Mint call
-// issued before the cached token's refresh instant reuses the cached
-// value instead of re-exchanging.
-func TestMint_CachesWithinTokenLifetime(t *testing.T) {
+// TestMint_ExchangesOnEveryCall pins the division of responsibility
+// between this type and the destinations package: Impl performs no
+// caching of its own, so every Mint call reaches the registry's
+// token endpoint. The identity-invariant cache that keeps /token
+// bursts from repeating the exchange is applied by BuildRegistry in
+// the parent package and is tested there.
+func TestMint_ExchangesOnEveryCall(t *testing.T) {
 	t.Parallel()
 	endpoint := newTokenEndpoint(t, func(call int) (int, string) {
 		return http.StatusOK, fmt.Sprintf(`{"token":"tok-%d","expires_in":300}`, call)
@@ -293,8 +296,6 @@ func TestMint_CachesWithinTokenLifetime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	frozen := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
-	d.SetNow(func() time.Time { return frozen })
 
 	first, err := d.Mint(context.Background(), newTestIdentity())
 	if err != nil {
@@ -304,51 +305,8 @@ func TestMint_CachesWithinTokenLifetime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Mint #2: %v", err)
 	}
-	if first.Value != second.Value {
-		t.Errorf("expected cached value to be reused: got %q then %q", first.Value, second.Value)
-	}
-	if got := endpoint.callCount(); got != 1 {
-		t.Errorf("token endpoint call count: got %d, want 1 (second Mint should have hit the cache)", got)
-	}
-}
-
-// TestMint_RefreshesAfterExpiry confirms that once the clock passes
-// the cached token's refresh instant (reported expiry minus the
-// safety margin), the next Mint re-exchanges.
-func TestMint_RefreshesAfterExpiry(t *testing.T) {
-	t.Parallel()
-	endpoint := newTokenEndpoint(t, func(call int) (int, string) {
-		return http.StatusOK, fmt.Sprintf(`{"token":"tok-%d","expires_in":60}`, call)
-	})
-	cfg := &registrytokenexchange.Config{
-		TokenURL: endpoint.URL() + "/v2/token",
-		Username: "u",
-		File:     writeSecret(t, "s"),
-	}
-	d, err := registrytokenexchange.New("d", cfg)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	now := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
-	d.SetNow(func() time.Time { return now })
-
-	first, err := d.Mint(context.Background(), newTestIdentity())
-	if err != nil {
-		t.Fatalf("Mint #1: %v", err)
-	}
-	if first.Value != "tok-1" {
-		t.Fatalf("Value #1: got %q, want %q", first.Value, "tok-1")
-	}
-
-	// Advance past expiry (60s) minus the refresh skew.
-	now = now.Add(56 * time.Second)
-
-	second, err := d.Mint(context.Background(), newTestIdentity())
-	if err != nil {
-		t.Fatalf("Mint #2: %v", err)
-	}
-	if second.Value != "tok-2" {
-		t.Errorf("Value #2: got %q, want %q (expected re-exchange after expiry)", second.Value, "tok-2")
+	if first.Value != "tok-1" || second.Value != "tok-2" {
+		t.Errorf("Values: got %q, %q; want tok-1, tok-2", first.Value, second.Value)
 	}
 	if got := endpoint.callCount(); got != 2 {
 		t.Errorf("token endpoint call count: got %d, want 2", got)
@@ -357,8 +315,9 @@ func TestMint_RefreshesAfterExpiry(t *testing.T) {
 
 // TestMint_DefaultsTTLWhenExpiresInAbsent covers registries that omit
 // expires_in entirely, which the Docker Registry v2 token-auth spec
-// permits. The destination must still succeed and fall back to
-// DefaultCacheTTL rather than failing the mint.
+// permits. The destination must still succeed and stamp an expiry of
+// now plus DefaultCacheTTL rather than failing the mint or returning
+// a zero expiry (which would defeat the parent package's cache).
 func TestMint_DefaultsTTLWhenExpiresInAbsent(t *testing.T) {
 	t.Parallel()
 	endpoint := newTokenEndpoint(t, func(call int) (int, string) {
@@ -373,29 +332,15 @@ func TestMint_DefaultsTTLWhenExpiresInAbsent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	frozen := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
+	d.SetNow(func() time.Time { return frozen })
 
-	// ExpiresAt reflects the real registry-side deadline, computed
-	// by httptokenexchange from the real clock (it has no injectable
-	// clock of its own), so assert it against a real-time window
-	// rather than a frozen SetNow value.
-	before := time.Now()
-	first, err := d.Mint(context.Background(), newTestIdentity())
-	after := time.Now()
+	tok, err := d.Mint(context.Background(), newTestIdentity())
 	if err != nil {
-		t.Fatalf("Mint #1: %v", err)
+		t.Fatalf("Mint: %v", err)
 	}
-	minExpiry := before.Add(registrytokenexchange.DefaultCacheTTL)
-	maxExpiry := after.Add(registrytokenexchange.DefaultCacheTTL)
-	if first.ExpiresAt.Before(minExpiry) || first.ExpiresAt.After(maxExpiry) {
-		t.Errorf("ExpiresAt: got %v, want within [%v, %v]", first.ExpiresAt, minExpiry, maxExpiry)
-	}
-
-	// Still within the default TTL: cached, no second call.
-	if _, err := d.Mint(context.Background(), newTestIdentity()); err != nil {
-		t.Fatalf("Mint #2: %v", err)
-	}
-	if got := endpoint.callCount(); got != 1 {
-		t.Errorf("token endpoint call count: got %d, want 1 (default TTL should still be cached)", got)
+	if want := frozen.Add(registrytokenexchange.DefaultCacheTTL); !tok.ExpiresAt.Equal(want) {
+		t.Errorf("ExpiresAt: got %v, want %v", tok.ExpiresAt, want)
 	}
 }
 
@@ -417,17 +362,15 @@ func TestMint_HonoursConfiguredDefaultTTL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	frozen := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
+	d.SetNow(func() time.Time { return frozen })
 
-	before := time.Now()
 	tok, err := d.Mint(context.Background(), newTestIdentity())
-	after := time.Now()
 	if err != nil {
 		t.Fatalf("Mint: %v", err)
 	}
-	minExpiry := before.Add(10 * time.Second)
-	maxExpiry := after.Add(10 * time.Second)
-	if tok.ExpiresAt.Before(minExpiry) || tok.ExpiresAt.After(maxExpiry) {
-		t.Errorf("ExpiresAt: got %v, want within [%v, %v]", tok.ExpiresAt, minExpiry, maxExpiry)
+	if want := frozen.Add(10 * time.Second); !tok.ExpiresAt.Equal(want) {
+		t.Errorf("ExpiresAt: got %v, want %v", tok.ExpiresAt, want)
 	}
 }
 
@@ -453,100 +396,9 @@ func TestMint_UpstreamFailureSurfacesAsError(t *testing.T) {
 	}
 }
 
-// TestMint_UpstreamFailureIsNotCached confirms that a failed exchange
-// does not poison the cache: the next Mint call retries rather than
-// replaying the failure indefinitely.
-func TestMint_UpstreamFailureIsNotCached(t *testing.T) {
-	t.Parallel()
-	endpoint := newTokenEndpoint(t, func(call int) (int, string) {
-		if call == 1 {
-			return http.StatusServiceUnavailable, `{"error":"try again"}`
-		}
-		return http.StatusOK, `{"token":"recovered","expires_in":300}`
-	})
-	cfg := &registrytokenexchange.Config{
-		TokenURL: endpoint.URL() + "/v2/token",
-		Username: "u",
-		File:     writeSecret(t, "s"),
-	}
-	d, err := registrytokenexchange.New("d", cfg)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	if _, err := d.Mint(context.Background(), newTestIdentity()); err == nil {
-		t.Fatal("Mint #1: expected error, got nil")
-	}
-	tok, err := d.Mint(context.Background(), newTestIdentity())
-	if err != nil {
-		t.Fatalf("Mint #2: %v", err)
-	}
-	if tok.Value != "recovered" {
-		t.Errorf("Value: got %q, want %q", tok.Value, "recovered")
-	}
-}
-
-// TestMint_ConcurrentMissesDedup pins the singleflight behaviour:
-// a burst of concurrent Mint calls against a cold cache must produce
-// exactly one exchange call to the token endpoint.
-func TestMint_ConcurrentMissesDedup(t *testing.T) {
-	t.Parallel()
-	release := make(chan struct{})
-	var inFlight int32
-	endpoint := newTokenEndpoint(t, func(call int) (int, string) {
-		atomic.AddInt32(&inFlight, 1)
-		<-release
-		return http.StatusOK, fmt.Sprintf(`{"token":"tok-%d","expires_in":300}`, call)
-	})
-	cfg := &registrytokenexchange.Config{
-		TokenURL: endpoint.URL() + "/v2/token",
-		Username: "u",
-		File:     writeSecret(t, "s"),
-	}
-	d, err := registrytokenexchange.New("d", cfg)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-
-	const n = 10
-	var wg sync.WaitGroup
-	results := make([]*registrytokenexchange.Token, n)
-	errs := make([]error, n)
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			results[i], errs[i] = d.Mint(context.Background(), newTestIdentity())
-		}(i)
-	}
-	// Let every goroutine reach the handler before releasing it, so
-	// this actually exercises the concurrent-miss path rather than
-	// racing goroutine scheduling.
-	deadline := time.Now().Add(2 * time.Second)
-	for atomic.LoadInt32(&inFlight) < 1 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	close(release)
-	wg.Wait()
-
-	for i, err := range errs {
-		if err != nil {
-			t.Fatalf("Mint #%d: %v", i, err)
-		}
-	}
-	for i, r := range results {
-		if r.Value != results[0].Value {
-			t.Errorf("result #%d: got %q, want %q (all concurrent callers should share one exchange)", i, r.Value, results[0].Value)
-		}
-	}
-	if got := endpoint.callCount(); got != 1 {
-		t.Errorf("token endpoint call count: got %d, want 1", got)
-	}
-}
-
 // TestMint_RereadsSecretFileOnRotation confirms that a secret
 // rotated on disk between exchanges takes effect on the next
-// exchange, without a broker restart. This can only be observed
-// across a real cache miss, so the test forces one via SetNow.
+// exchange, without a broker restart.
 func TestMint_RereadsSecretFileOnRotation(t *testing.T) {
 	t.Parallel()
 	var gotPasswords []string
@@ -563,8 +415,6 @@ func TestMint_RereadsSecretFileOnRotation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	now := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
-	d.SetNow(func() time.Time { return now })
 
 	if _, err := d.Mint(context.Background(), newTestIdentity()); err != nil {
 		t.Fatalf("Mint #1: %v", err)
@@ -578,7 +428,6 @@ func TestMint_RereadsSecretFileOnRotation(t *testing.T) {
 	if err := os.WriteFile(path, []byte("v2"), 0o600); err != nil {
 		t.Fatalf("rewrite secret: %v", err)
 	}
-	now = now.Add(56 * time.Second) // force a cache miss
 
 	if _, err := d.Mint(context.Background(), newTestIdentity()); err != nil {
 		t.Fatalf("Mint #2: %v", err)

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -276,18 +277,23 @@ func TestBuildRegistry_StaticSecretMissingFileIsRejectedAtBuild(t *testing.T) {
 // destination performs the two-legged Basic-auth-to-bearer-token
 // exchange against a fake token endpoint and dispenses the opaque
 // bearer token with scheme "bearer" and no username, matching the
-// response shape of every other bearer-token destination.
+// response shape of every other bearer-token destination. A second
+// Mint within the token's lifetime must be served from the generic
+// identity-invariant cache BuildRegistry wraps this type in, without
+// a second upstream exchange.
 func TestBuildRegistry_RegistryTokenExchangeHappyPath(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "secret")
 	if err := os.WriteFile(path, []byte("s3cr3t"), 0o600); err != nil {
 		t.Fatalf("write secret: %v", err)
 	}
+	var exchanges int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if user, pass, ok := r.BasicAuth(); !ok || user != "robot" || pass != "s3cr3t" {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
+		atomic.AddInt32(&exchanges, 1)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"token":"opaque-bearer-token","expires_in":300}`))
 	}))
@@ -321,6 +327,14 @@ func TestBuildRegistry_RegistryTokenExchangeHappyPath(t *testing.T) {
 	}
 	if tok.Username != "" {
 		t.Errorf("Username: got %q, want empty", tok.Username)
+	}
+
+	if _, err := reg.Lookup("registry").Mint(context.Background(),
+		&auth.Identity{Type: auth.IdentityTypeCI, Principal: "p"}); err != nil {
+		t.Fatalf("Mint #2: %v", err)
+	}
+	if got := atomic.LoadInt32(&exchanges); got != 1 {
+		t.Errorf("upstream exchange count: got %d, want 1 (second Mint should be served from the cache)", got)
 	}
 }
 
