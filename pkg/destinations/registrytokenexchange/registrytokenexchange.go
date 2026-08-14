@@ -7,17 +7,15 @@
 // resource request. Such registries reject Basic auth on resource
 // endpoints outright; only the token endpoint accepts it.
 //
-// The type exists for broker consumers that dispense whatever value
-// comes back from a destination verbatim as the full Authorization
-// header, with no client-side assembly of scheme + username (see
-// bb-remote-asset's OCI/Docker downloader for one such consumer). A
-// staticSecret destination cannot serve this flow: a precomputed
-// static credential is rejected by the registry's resource
-// endpoints regardless of validity, because those endpoints never
-// accept Basic auth at all. registryTokenExchange instead performs
-// the two-legged exchange itself and dispenses the result already
-// formatted as a complete header value ("Bearer <token>"), with no
-// separate scheme or username set.
+// A staticSecret destination cannot serve this flow: a static
+// credential is rejected by the registry's resource endpoints
+// regardless of validity, because those endpoints never accept
+// Basic auth at all, and the bearer token they do accept does not
+// exist until exchange time. registryTokenExchange performs the
+// two-legged exchange itself and dispenses the resulting bearer
+// token through the standard response shape (scheme "bearer"), so
+// consumers present it exactly as they would any other
+// bearer-token destination's credential.
 //
 // Implementation: the destination compiles its configuration down to
 // an httpTokenExchange config at construction time — the same
@@ -39,8 +37,9 @@
 //     typically valid for as little as 60 seconds and the exchange
 //     is not identity-scoped: every caller of a given destination
 //     gets the same token, so sharing one cached value across
-//     concurrent /token requests avoids hammering the registry's
-//     token endpoint.
+//     concurrent /token requests produces a single exchange call
+//     against the registry's token endpoint rather than one per
+//     request.
 package registrytokenexchange
 
 import (
@@ -121,10 +120,11 @@ type Config struct {
 // package wraps Impl in an adapter that translates between the two
 // so that this child package avoids an import cycle on its parent.
 type Token struct {
-	// Value is the complete Authorization header value
-	// ("Bearer <token>"), ready to use verbatim. There is no
-	// separate scheme or username: the adapter that projects this
-	// onto destinations.Token leaves both empty.
+	// Value is the opaque bearer token returned by the registry's
+	// token endpoint, dispensed verbatim. The adapter that projects
+	// this onto the parent package's Token sets the scheme to
+	// "bearer", so the /token response is shaped identically to an
+	// httpTokenExchange destination's.
 	Value     string
 	ExpiresAt time.Time
 }
@@ -260,9 +260,9 @@ func (i *Impl) Name() string { return i.name }
 // production callers should not invoke it.
 func (i *Impl) SetNow(f func() time.Time) { i.now = f }
 
-// Mint returns a cached "Bearer <token>" value when one is fresh,
-// otherwise performs the two-legged exchange via the inner
-// httpTokenExchange destination and caches the result.
+// Mint returns the cached bearer token when one is fresh, otherwise
+// performs the two-legged exchange via the inner httpTokenExchange
+// destination and caches the result.
 //
 // Concurrent misses for this destination are de-duplicated with the
 // same mutex-plus-WaitGroup pattern pkg/egressauthd's client-side
@@ -315,7 +315,7 @@ func (i *Impl) Mint(ctx context.Context, identity *auth.Identity) (*Token, error
 	}
 
 	tok := &Token{
-		Value:     "Bearer " + innerTok.Value,
+		Value:     innerTok.Value,
 		ExpiresAt: innerTok.ExpiresAt,
 	}
 

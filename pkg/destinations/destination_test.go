@@ -274,9 +274,9 @@ func TestBuildRegistry_StaticSecretMissingFileIsRejectedAtBuild(t *testing.T) {
 // TestBuildRegistry_RegistryTokenExchangeHappyPath exercises the
 // registryTokenExchange dispatch end to end: the constructed
 // destination performs the two-legged Basic-auth-to-bearer-token
-// exchange against a fake token endpoint and dispenses the result
-// as a complete Authorization header value with no separate scheme
-// or username.
+// exchange against a fake token endpoint and dispenses the opaque
+// bearer token with scheme "bearer" and no username, matching the
+// response shape of every other bearer-token destination.
 func TestBuildRegistry_RegistryTokenExchangeHappyPath(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "secret")
@@ -313,11 +313,11 @@ func TestBuildRegistry_RegistryTokenExchangeHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Mint: %v", err)
 	}
-	if tok.Value != "Bearer opaque-bearer-token" {
-		t.Errorf("Value: got %q, want %q", tok.Value, "Bearer opaque-bearer-token")
+	if tok.Value != "opaque-bearer-token" {
+		t.Errorf("Value: got %q, want %q", tok.Value, "opaque-bearer-token")
 	}
-	if tok.Scheme != "" {
-		t.Errorf("Scheme: got %q, want empty (value is already a complete Authorization header)", tok.Scheme)
+	if tok.Scheme != "bearer" {
+		t.Errorf("Scheme: got %q, want %q", tok.Scheme, "bearer")
 	}
 	if tok.Username != "" {
 		t.Errorf("Username: got %q, want empty", tok.Username)

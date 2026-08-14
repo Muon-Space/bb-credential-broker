@@ -162,9 +162,8 @@ func TestNew_RejectsZeroCacheTTL(t *testing.T) {
 
 // TestMint_HappyPath exercises the full two-legged exchange: the
 // broker GETs the configured token endpoint with service/scope query
-// params and a Basic-auth header, and dispenses the extracted token
-// reformatted as a complete "Bearer <token>" Authorization value with
-// no separate scheme or username.
+// params and a Basic-auth header, and dispenses the extracted opaque
+// bearer token verbatim.
 func TestMint_HappyPath(t *testing.T) {
 	t.Parallel()
 	endpoint := newTokenEndpoint(t, func(int) (int, string) {
@@ -187,8 +186,8 @@ func TestMint_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Mint: %v", err)
 	}
-	if tok.Value != "Bearer opaque-bearer-token" {
-		t.Errorf("Value: got %q, want %q", tok.Value, "Bearer opaque-bearer-token")
+	if tok.Value != "opaque-bearer-token" {
+		t.Errorf("Value: got %q, want %q", tok.Value, "opaque-bearer-token")
 	}
 
 	req := endpoint.lastRequest()
@@ -272,8 +271,8 @@ func TestMint_AcceptsAccessTokenAlias(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Mint: %v", err)
 	}
-	if tok.Value != "Bearer aliased-token" {
-		t.Errorf("Value: got %q, want %q", tok.Value, "Bearer aliased-token")
+	if tok.Value != "aliased-token" {
+		t.Errorf("Value: got %q, want %q", tok.Value, "aliased-token")
 	}
 }
 
@@ -337,8 +336,8 @@ func TestMint_RefreshesAfterExpiry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Mint #1: %v", err)
 	}
-	if first.Value != "Bearer tok-1" {
-		t.Fatalf("Value #1: got %q, want %q", first.Value, "Bearer tok-1")
+	if first.Value != "tok-1" {
+		t.Fatalf("Value #1: got %q, want %q", first.Value, "tok-1")
 	}
 
 	// Advance past expiry (60s) minus the refresh skew.
@@ -348,8 +347,8 @@ func TestMint_RefreshesAfterExpiry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Mint #2: %v", err)
 	}
-	if second.Value != "Bearer tok-2" {
-		t.Errorf("Value #2: got %q, want %q (expected re-exchange after expiry)", second.Value, "Bearer tok-2")
+	if second.Value != "tok-2" {
+		t.Errorf("Value #2: got %q, want %q (expected re-exchange after expiry)", second.Value, "tok-2")
 	}
 	if got := endpoint.callCount(); got != 2 {
 		t.Errorf("token endpoint call count: got %d, want 2", got)
@@ -481,8 +480,8 @@ func TestMint_UpstreamFailureIsNotCached(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Mint #2: %v", err)
 	}
-	if tok.Value != "Bearer recovered" {
-		t.Errorf("Value: got %q, want %q", tok.Value, "Bearer recovered")
+	if tok.Value != "recovered" {
+		t.Errorf("Value: got %q, want %q", tok.Value, "recovered")
 	}
 }
 

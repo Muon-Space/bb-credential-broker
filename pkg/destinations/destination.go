@@ -11,10 +11,8 @@
 // oidcTokenExchange, a type-safe sugar over httpTokenExchange for
 // the canonical RFC 8693 flow; and registryTokenExchange, which
 // performs the Docker Registry v2 / OCI Distribution Spec
-// bearer-token exchange and dispenses the result as a complete,
-// ready-to-use Authorization header value. New types are added by
-// appending a new case to BuildRegistry and a new sub-package under
-// destinations/.
+// bearer-token exchange. New types are added by appending a new
+// case to BuildRegistry and a new sub-package under destinations/.
 package destinations
 
 import (
@@ -296,12 +294,11 @@ func (a *staticSecretAdapter) RenderRequest(_ context.Context, _ *auth.Identity)
 
 // registryTokenExchangeAdapter converts the package-internal Token
 // shape returned by registrytokenexchange.Impl.Mint into the public
-// Token type. Unlike httpTokenExchangeAdapter, it does not default
-// Scheme to "bearer" and never sets Username: the inner Value is
-// already a complete Authorization header value ("Bearer <token>"),
-// so a consumer that dispenses the value verbatim needs nothing
-// else, and a consumer that assembles scheme + username itself would
-// double-prefix the header if Scheme were also set.
+// Token type. The dispensed value is the opaque bearer token from
+// the registry's token endpoint, presented with scheme "bearer"
+// like every other bearer-token destination so that consumers
+// assemble the Authorization header uniformly; Username is never
+// set because this flow has no basic-auth leg on the dispense side.
 type registryTokenExchangeAdapter struct {
 	impl *registrytokenexchange.Impl
 }
@@ -314,6 +311,7 @@ func (a *registryTokenExchangeAdapter) Mint(ctx context.Context, identity *auth.
 	return &Token{
 		Value:     t.Value,
 		ExpiresAt: t.ExpiresAt,
+		Scheme:    "bearer",
 	}, nil
 }
 

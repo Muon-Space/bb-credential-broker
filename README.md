@@ -188,18 +188,13 @@ header, and receives a short-lived opaque bearer token in return:
 
 That token — not the original Basic credential — is what the actual
 resource request must carry, as `Authorization: Bearer <token>`. A
-`staticSecret` destination cannot serve this flow even if it were
-configured to dispense a precomputed `Basic base64(user:secret)` string:
-the registry's resource endpoints reject Basic auth unconditionally, so
-a client that uses a dispensed value verbatim as its Authorization
-header (skipping any scheme/username assembly of its own — the
-motivating case is a downstream client such as an OCI/Docker artifact
-downloader that has no notion of a two-legged exchange) can never
-succeed against this class of registry no matter how the static
-credential is packaged.
+`staticSecret` destination cannot serve this flow: the credential the
+resource endpoints accept does not exist until exchange time, so no
+precomputed value — not even a ready-made `Basic base64(user:secret)`
+string — can ever succeed against this class of registry.
 
 `registryTokenExchange` performs the exchange itself and dispenses the
-*result* already formatted as a complete Authorization header value:
+resulting bearer token:
 
 ```jsonnet
 'oci-registry-pull': {
@@ -207,20 +202,22 @@ credential is packaged.
     tokenUrl: 'https://registry.example.com/v2/token',
     service:  'registry.example.com',
     scope:    'repository:my-repo:pull',
-    username: 'robot$ci',
+    username: 'ci-pull',
     file:     '/etc/broker/destinations/oci-registry-pull',  // K8s Secret mount
     // cacheTtl: '60s',  // optional; see below
   },
 },
 ```
 
-The `/token` response carries the value in the standard `token` field —
-here a literal `Bearer <opaque token>` string — with `scheme` and
-`username` both empty, matching the "value is already the final header"
-contract a verbatim-forwarding client needs. Callers that build their
-own `Authorization` header from `scheme` + `username` + `token` are
-unaffected by this destination type; they simply see an empty `scheme`
-and forward `token` as-is.
+The `/token` response carries the exchanged token in the standard
+`token` field with `scheme: 'bearer'`, exactly like an
+`httpTokenExchange` destination: callers construct
+`Authorization: Bearer <token>`. Downstream clients that forward a
+stored credential verbatim as their full Authorization header value
+(with no scheme assembly of their own) are served by whatever
+projects the dispensed credential into their configuration
+prepending the scheme — the same composition every bearer-token
+destination already requires of such clients.
 
 The credential file follows the same convention as `staticSecret`'s
 `file`: mount it from a Kubernetes Secret, populate it from whatever
@@ -244,11 +241,10 @@ de-duplicated so a burst of requests for one destination produces a
 single exchange call against the registry's token endpoint, rather than
 one per request.
 
-**Not renderable as a template preview.** Unlike `httpTokenExchange` and
-`oidcTokenExchange`, `registryTokenExchange`'s request has no
-per-identity template surface — `tokenUrl`, `service` and `scope` are
-fixed operator configuration, not derived from the caller's `Identity`
-— so `bb-credential-broker render` shows the exact resolved URL with a
+**Rendering.** `registryTokenExchange`'s request has no per-identity
+template surface — `tokenUrl`, `service` and `scope` are fixed
+operator configuration, not derived from the caller's `Identity` — so
+`bb-credential-broker render` shows the exact resolved URL with a
 redacted Authorization placeholder rather than the real Basic-auth
 value, which is computed fresh at dispatch time from the credential
 file.
