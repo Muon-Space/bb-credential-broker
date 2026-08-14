@@ -1,5 +1,5 @@
 // Example bb-credential-broker configuration. The shape mirrors the
-// schema documented in pkg/config/config.go. Three destinations are
+// schema documented in pkg/config/config.go. Several destinations are
 // configured below to illustrate the standard patterns:
 //
 //   - artifactory-prod: an RFC 8693 OAuth 2.0 token-exchange flow,
@@ -10,10 +10,13 @@
 //     short-lived installation token.
 //   - vault-jwt:        a Vault auth/jwt/login flow that returns a
 //     client token in exchange for a JWT proof of identity.
+//   - oci-registry-pull: a Docker Registry v2 / OCI Distribution Spec
+//     bearer-token exchange, dispensed as a ready-to-use Authorization
+//     header value for clients that forward it verbatim.
 //
-// Adding a fourth destination is purely a configuration change: the
+// Adding another destination is purely a configuration change: the
 // broker contains no protocol-specific code beyond the generic
-// httpTokenExchange type used here.
+// destination types used here.
 
 {
   apiServer: {
@@ -302,6 +305,34 @@
         scheme:   'basic',
         username: 'x-access-token',
         cacheTtl: '1h',
+      },
+    },
+
+    // registryTokenExchange performs the Docker Registry v2 / OCI
+    // Distribution Spec bearer-token flow: GET tokenUrl with the
+    // service/scope query params and an Authorization: Basic header
+    // built from username + file, then dispense the response's token
+    // reformatted as a complete "Bearer <token>" Authorization value.
+    // service/scope mirror the values from the registry's own
+    // WWW-Authenticate: Bearer realm="...",service="...",scope="..."
+    // challenge on a 401 from a resource endpoint.
+    //
+    // Unlike staticSecret, a static credential cannot serve this flow
+    // even when precomputed as "Basic base64(user:secret)": registries
+    // implementing this spec reject Basic auth on resource endpoints
+    // unconditionally and accept it only at tokenUrl. This destination
+    // performs the exchange itself so a consumer that forwards the
+    // dispensed value verbatim as its Authorization header (no
+    // scheme/username assembly of its own) still works.
+    'oci-registry-pull': {
+      registryTokenExchange: {
+        tokenUrl: 'https://registry.example.com/v2/token',
+        service:  'registry.example.com',
+        scope:    'repository:my-repo:pull',
+        username: 'robot$ci',
+        file:     '/etc/broker/destinations/oci-registry-pull',
+        // cacheTtl defaults to 60s, used only when the token
+        // endpoint's response omits expires_in.
       },
     },
   },

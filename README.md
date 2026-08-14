@@ -32,12 +32,16 @@ directly (relaying an action's delegation grant); it adds no broker-side
 endpoint.
 
 The broker has no compiled-in knowledge of any particular destination
-service. It ships two generic destination types parameterised entirely
+service. It ships generic destination types parameterised entirely
 from the operator's configuration: `httpTokenExchange`, which expresses
-every mint flow as a templated HTTP request, and `staticSecret`, which
-dispenses a credential read verbatim from a file on disk. Adding support
-for a new destination protocol is a configuration change rather than a
-code change.
+every mint flow as a templated HTTP request; `staticSecret`, which
+dispenses a credential read verbatim from a file on disk; `oidcTokenExchange`,
+a type-safe sugar over `httpTokenExchange` for the canonical RFC 8693 flow;
+and `registryTokenExchange`, which performs the Docker Registry v2 / OCI
+Distribution Spec bearer-token exchange (see
+[Registry bearer-token exchange](#registry-bearer-token-exchange)). Adding
+support for a new destination protocol is a configuration change rather
+than a code change.
 
 ## Configuration
 
@@ -76,6 +80,17 @@ The top-level structure is:
         scheme:   'bearer' | 'basic',                 // optional, default 'bearer'
         username: '<basic-auth username>',            // optional, used when scheme='basic'
         cacheTtl: '<go duration>',                    // optional, default '1h'
+      },
+    },
+    'registry-token-exchange-destination': {
+      registryTokenExchange: {
+        tokenUrl: 'https://registry.example.com/v2/token',  // the registry's token endpoint
+        service:  'registry.example.com',                   // optional, sent as the ?service= query param
+        scope:    'repository:my-repo:pull',                // optional, sent as the ?scope= query param
+        username: '<basic-auth username>',
+        file:     '/etc/broker/destinations/<name>',        // K8s Secret mount holding the paired password/PAT
+        cacheTtl: '<go duration>',                           // optional, default '60s'; used only when the
+                                                              // token endpoint's response omits expires_in
       },
     },
     ...
@@ -150,6 +165,93 @@ single-resource scope where possible) and rotate the underlying Secret
 out of band on whatever cadence your threat model demands. The broker
 re-reads the file on every `Mint`, so the next dispense after rotation
 returns the new value with no broker restart.
+
+### Registry bearer-token exchange
+
+Some destination services — any registry implementing the Docker
+Registry v2 / OCI Distribution Spec token-authentication flow — reject
+Basic auth on their resource endpoints outright and accept it only at a
+dedicated token endpoint. A request against such a registry challenges
+with:
+
+```
+WWW-Authenticate: Bearer realm="https://registry.example.com/v2/token",service="registry.example.com",scope="repository:my-repo:pull"
+```
+
+The client is expected to `GET` the `realm` URL with the `service` and
+`scope` query parameters and an `Authorization: Basic base64(user:secret)`
+header, and receives a short-lived opaque bearer token in return:
+
+```json
+{ "token": "<opaque bearer token>", "expires_in": 300 }
+```
+
+That token — not the original Basic credential — is what the actual
+resource request must carry, as `Authorization: Bearer <token>`. A
+`staticSecret` destination cannot serve this flow even if it were
+configured to dispense a precomputed `Basic base64(user:secret)` string:
+the registry's resource endpoints reject Basic auth unconditionally, so
+a client that uses a dispensed value verbatim as its Authorization
+header (skipping any scheme/username assembly of its own — the
+motivating case is a downstream client such as an OCI/Docker artifact
+downloader that has no notion of a two-legged exchange) can never
+succeed against this class of registry no matter how the static
+credential is packaged.
+
+`registryTokenExchange` performs the exchange itself and dispenses the
+*result* already formatted as a complete Authorization header value:
+
+```jsonnet
+'oci-registry-pull': {
+  registryTokenExchange: {
+    tokenUrl: 'https://registry.example.com/v2/token',
+    service:  'registry.example.com',
+    scope:    'repository:my-repo:pull',
+    username: 'robot$ci',
+    file:     '/etc/broker/destinations/oci-registry-pull',  // K8s Secret mount
+    // cacheTtl: '60s',  // optional; see below
+  },
+},
+```
+
+The `/token` response carries the value in the standard `token` field —
+here a literal `Bearer <opaque token>` string — with `scheme` and
+`username` both empty, matching the "value is already the final header"
+contract a verbatim-forwarding client needs. Callers that build their
+own `Authorization` header from `scheme` + `username` + `token` are
+unaffected by this destination type; they simply see an empty `scheme`
+and forward `token` as-is.
+
+The credential file follows the same convention as `staticSecret`'s
+`file`: mount it from a Kubernetes Secret, populate it from whatever
+backend is already in use, and rotate it out of band. Unlike
+`staticSecret`, the file is not re-read on every dispense — it is read
+fresh only on every actual exchange with the registry's token endpoint,
+because dispenses are served from a short-lived cache in between (see
+below). Rotating the underlying Secret still takes effect with no
+broker restart, just on the cache's cadence rather than every request.
+
+**Caching.** The opaque token this flow returns is typically valid for
+as little as 60 seconds and carries no inspectable structure (it is not
+a JWT, so its real lifetime can't be introspected client-side), and the
+exchange is not identity-scoped — every caller of a given destination
+gets the same token. The broker caches the exchanged value per
+destination, bounded by the response's `expires_in` when present (with
+a safety margin before the reported expiry) or by `cacheTtl` (default
+`60s`) when the response omits `expires_in`, which the spec permits.
+Concurrent `/token` requests that miss the cache at the same time are
+de-duplicated so a burst of requests for one destination produces a
+single exchange call against the registry's token endpoint, rather than
+one per request.
+
+**Not renderable as a template preview.** Unlike `httpTokenExchange` and
+`oidcTokenExchange`, `registryTokenExchange`'s request has no
+per-identity template surface — `tokenUrl`, `service` and `scope` are
+fixed operator configuration, not derived from the caller's `Identity`
+— so `bb-credential-broker render` shows the exact resolved URL with a
+redacted Authorization placeholder rather than the real Basic-auth
+value, which is computed fresh at dispatch time from the credential
+file.
 
 ### Broker-signed JWTs
 
@@ -923,7 +1025,10 @@ non-success status codes).
 Destinations that perform no upstream call — the `staticSecret`
 type — omit the `upstream_url`, `upstream_status`,
 `upstream_duration_ms` and `upstream_response_excerpt` fields
-entirely.
+entirely. `registryTokenExchange` populates them only on the
+`/token` requests that miss its internal cache and actually reach
+the registry's token endpoint; cache hits omit them the same way
+`staticSecret` always does.
 
 The `egress-authd` sidecar emits its own separate audit stream
 (`"event": "egress"`, one line per proxied request). It carries no

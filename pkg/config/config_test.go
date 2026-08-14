@@ -257,8 +257,8 @@ func TestLoad_ExampleConfigParses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if len(cfg.Destinations) != 5 {
-		t.Errorf("Destinations: got %d, want 5", len(cfg.Destinations))
+	if len(cfg.Destinations) != 6 {
+		t.Errorf("Destinations: got %d, want 6", len(cfg.Destinations))
 	}
 	if len(cfg.Secrets) != 2 {
 		t.Errorf("Secrets: got %d, want 2", len(cfg.Secrets))

@@ -4,12 +4,17 @@
 // that maps the operator-supplied configuration to the underlying
 // destination type implementations.
 //
-// The broker ships two destination types: httpTokenExchange, which
-// expresses every mint flow as a templated HTTP request, and
+// The broker ships several destination types: httpTokenExchange,
+// which expresses every mint flow as a templated HTTP request;
 // staticSecret, which dispenses a credential read from a file on
-// disk for systems whose API does not expose an OIDC exchange. New
-// types are added by appending a new case to BuildRegistry and a
-// new sub-package under destinations/.
+// disk for systems whose API does not expose an OIDC exchange;
+// oidcTokenExchange, a type-safe sugar over httpTokenExchange for
+// the canonical RFC 8693 flow; and registryTokenExchange, which
+// performs the Docker Registry v2 / OCI Distribution Spec
+// bearer-token exchange and dispenses the result as a complete,
+// ready-to-use Authorization header value. New types are added by
+// appending a new case to BuildRegistry and a new sub-package under
+// destinations/.
 package destinations
 
 import (
@@ -23,6 +28,7 @@ import (
 	"github.com/Muon-Space/bb-credential-broker/pkg/auth"
 	"github.com/Muon-Space/bb-credential-broker/pkg/destinations/httptokenexchange"
 	"github.com/Muon-Space/bb-credential-broker/pkg/destinations/oidctokenexchange"
+	"github.com/Muon-Space/bb-credential-broker/pkg/destinations/registrytokenexchange"
 	"github.com/Muon-Space/bb-credential-broker/pkg/destinations/staticsecret"
 	"github.com/Muon-Space/bb-credential-broker/pkg/metrics"
 	"github.com/Muon-Space/bb-credential-broker/pkg/secrets"
@@ -157,9 +163,10 @@ func BuildRegistry(raw map[string]json.RawMessage, deps Dependencies) (Registry,
 // new destination type means adding a new field here and a new case
 // in buildOne.
 type destinationConfig struct {
-	HTTPTokenExchange *httptokenexchange.Config `json:"httpTokenExchange,omitempty"`
-	StaticSecret      *staticsecret.Config      `json:"staticSecret,omitempty"`
-	OIDCTokenExchange *oidctokenexchange.Config `json:"oidcTokenExchange,omitempty"`
+	HTTPTokenExchange     *httptokenexchange.Config     `json:"httpTokenExchange,omitempty"`
+	StaticSecret          *staticsecret.Config          `json:"staticSecret,omitempty"`
+	OIDCTokenExchange     *oidctokenexchange.Config     `json:"oidcTokenExchange,omitempty"`
+	RegistryTokenExchange *registrytokenexchange.Config `json:"registryTokenExchange,omitempty"`
 }
 
 // buildOne dispatches a single destinations entry to the appropriate
@@ -180,6 +187,9 @@ func buildOne(name string, msg json.RawMessage, deps Dependencies) (Destination,
 		set++
 	}
 	if cfg.OIDCTokenExchange != nil {
+		set++
+	}
+	if cfg.RegistryTokenExchange != nil {
 		set++
 	}
 	if set > 1 {
@@ -210,8 +220,14 @@ func buildOne(name string, msg json.RawMessage, deps Dependencies) (Destination,
 			return nil, err
 		}
 		return &httpTokenExchangeAdapter{impl: impl}, nil
+	case cfg.RegistryTokenExchange != nil:
+		impl, err := registrytokenexchange.New(name, cfg.RegistryTokenExchange)
+		if err != nil {
+			return nil, err
+		}
+		return &registryTokenExchangeAdapter{impl: impl}, nil
 	default:
-		return nil, fmt.Errorf("no destination type discriminator set; expected one of: httpTokenExchange, staticSecret, oidcTokenExchange")
+		return nil, fmt.Errorf("no destination type discriminator set; expected one of: httpTokenExchange, staticSecret, oidcTokenExchange, registryTokenExchange")
 	}
 }
 
@@ -276,6 +292,34 @@ func (a *staticSecretAdapter) Mint(ctx context.Context, identity *auth.Identity)
 // this destination type.
 func (a *staticSecretAdapter) RenderRequest(_ context.Context, _ *auth.Identity) (*http.Request, error) {
 	return nil, ErrNotRenderable
+}
+
+// registryTokenExchangeAdapter converts the package-internal Token
+// shape returned by registrytokenexchange.Impl.Mint into the public
+// Token type. Unlike httpTokenExchangeAdapter, it does not default
+// Scheme to "bearer" and never sets Username: the inner Value is
+// already a complete Authorization header value ("Bearer <token>"),
+// so a consumer that dispenses the value verbatim needs nothing
+// else, and a consumer that assembles scheme + username itself would
+// double-prefix the header if Scheme were also set.
+type registryTokenExchangeAdapter struct {
+	impl *registrytokenexchange.Impl
+}
+
+func (a *registryTokenExchangeAdapter) Mint(ctx context.Context, identity *auth.Identity) (*Token, error) {
+	t, err := a.impl.Mint(ctx, identity)
+	if err != nil {
+		return nil, err
+	}
+	return &Token{
+		Value:     t.Value,
+		ExpiresAt: t.ExpiresAt,
+	}, nil
+}
+
+// RenderRequest implements Renderable for registryTokenExchange.
+func (a *registryTokenExchangeAdapter) RenderRequest(ctx context.Context, identity *auth.Identity) (*http.Request, error) {
+	return a.impl.RenderRequest(ctx, identity)
 }
 
 // instrumentedDestination wraps an inner Destination with

@@ -271,6 +271,79 @@ func TestBuildRegistry_StaticSecretMissingFileIsRejectedAtBuild(t *testing.T) {
 	}
 }
 
+// TestBuildRegistry_RegistryTokenExchangeHappyPath exercises the
+// registryTokenExchange dispatch end to end: the constructed
+// destination performs the two-legged Basic-auth-to-bearer-token
+// exchange against a fake token endpoint and dispenses the result
+// as a complete Authorization header value with no separate scheme
+// or username.
+func TestBuildRegistry_RegistryTokenExchangeHappyPath(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "secret")
+	if err := os.WriteFile(path, []byte("s3cr3t"), 0o600); err != nil {
+		t.Fatalf("write secret: %v", err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if user, pass, ok := r.BasicAuth(); !ok || user != "robot" || pass != "s3cr3t" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"token":"opaque-bearer-token","expires_in":300}`))
+	}))
+	defer srv.Close()
+
+	raw := map[string]json.RawMessage{
+		"registry": json.RawMessage(`{
+			"registryTokenExchange": {
+				"tokenUrl": "` + srv.URL + `/v2/token",
+				"service":  "registry.example.com",
+				"scope":    "repository:my-repo:pull",
+				"username": "robot",
+				"file":     "` + path + `"
+			}
+		}`),
+	}
+	reg, err := destinations.BuildRegistry(raw, destinations.Dependencies{})
+	if err != nil {
+		t.Fatalf("BuildRegistry: %v", err)
+	}
+	tok, err := reg.Lookup("registry").Mint(context.Background(),
+		&auth.Identity{Type: auth.IdentityTypeCI, Principal: "p"})
+	if err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+	if tok.Value != "Bearer opaque-bearer-token" {
+		t.Errorf("Value: got %q, want %q", tok.Value, "Bearer opaque-bearer-token")
+	}
+	if tok.Scheme != "" {
+		t.Errorf("Scheme: got %q, want empty (value is already a complete Authorization header)", tok.Scheme)
+	}
+	if tok.Username != "" {
+		t.Errorf("Username: got %q, want empty", tok.Username)
+	}
+}
+
+func TestBuildRegistry_RegistryTokenExchangeMissingFileIsRejectedAtBuild(t *testing.T) {
+	t.Parallel()
+	raw := map[string]json.RawMessage{
+		"registry": json.RawMessage(`{
+			"registryTokenExchange": {
+				"tokenUrl": "https://example.com/v2/token",
+				"username": "robot",
+				"file":     "/does/not/exist"
+			}
+		}`),
+	}
+	_, err := destinations.BuildRegistry(raw, destinations.Dependencies{})
+	if err == nil {
+		t.Fatal("expected error for missing secret file at build time, got nil")
+	}
+	if !strings.Contains(err.Error(), "registry") {
+		t.Errorf("error %q should mention destination name", err.Error())
+	}
+}
+
 func TestBuildRegistry_RejectsMultipleDiscriminators(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "pat")
